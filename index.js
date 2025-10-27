@@ -35,7 +35,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '7mb' }));
 app.use(express.urlencoded({ extended: true, limit: '7mb' }));
 // Utilities for mail and calendar
-const { sendEmail } = require('./utils/mailer');
+const { sendEmail, getSmtpStatus } = require('./utils/mailer');
 const { generateICS, generateGoogleCalendarLink } = require('./utils/calendar');
 const { meetingEmailHtml } = require('./utils/templates/meetingEmail');
 const { hashPassword, verifyPassword, signToken, requireAuth, requireRole, ownerExists } = require('./auth');
@@ -326,6 +326,20 @@ app.post('/api/diagnostics/refresh-features', async (req, res) => {
       console.log('[Features refreshed]', JSON.stringify(featureFlags));
     }
     res.json(featureFlags);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Diagnostics: SMTP/email configuration status (no auth)
+app.get('/api/diagnostics/email-config', async (req, res) => {
+  try {
+    const status = await getSmtpStatus();
+    res.json({
+      ...status,
+      apiOrigin: process.env.API_ORIGIN || null,
+      mailFrom: process.env.MAIL_FROM || (process.env.SMTP_USER || null)
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2898,26 +2912,24 @@ app.post('/api/auth/login', async (req, res) => {
     const { identifier, email, password } = req.body || {};
     const idOrEmail = identifier || email;
     if (!idOrEmail || !password) return res.status(400).json({ error: 'identifier/email and password required' });
-    // Look up by username (case-insensitive) or email (case-insensitive)
+    // Single flexible lookup: accept either username OR email in one query (case-insensitive)
     const val = String(idOrEmail).trim();
-    let r;
-    if (val.includes('@')) {
-      r = await pool.query('SELECT * FROM public.users WHERE email=$1 AND active=TRUE', [val.toLowerCase()]);
-    } else {
-      r = await pool.query('SELECT * FROM public.users WHERE LOWER(username)=LOWER($1) AND active=TRUE', [val]);
-      // Fallback: if not found and identifier contains spaces, attempt full_name exact (case-insensitive) match when unique
-      if (r.rows.length === 0 && /\s/.test(val)) {
-        const rf = await pool.query('SELECT * FROM public.users WHERE active=TRUE AND LOWER(full_name)=LOWER($1)', [val]);
-        if (rf.rows.length === 1) {
-          r = rf;
-        }
+    let r = await pool.query(
+      'SELECT * FROM public.users WHERE active=TRUE AND (LOWER(username)=LOWER($1) OR LOWER(email)=LOWER($1))',
+      [val]
+    );
+    // Optional: if still not found and identifier looks like a full name, try exact case-insensitive full_name match when unique
+    if (r.rows.length === 0 && /\s/.test(val)) {
+      const rf = await pool.query('SELECT * FROM public.users WHERE active=TRUE AND LOWER(full_name)=LOWER($1)', [val]);
+      if (rf.rows.length === 1) {
+        r = rf;
       }
     }
     if (r.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
     const user = r.rows[0];
     const ok = await verifyPassword(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-  await pool.query('UPDATE public.users SET last_login=NOW() WHERE id=$1', [user.id]);
+    await pool.query('UPDATE public.users SET last_login=NOW() WHERE id=$1', [user.id]);
     const pub = { id: user.id, email: user.email, username: user.username, phone: user.phone, full_name: user.full_name, role: user.role, must_change_password: user.must_change_password };
     const token = signToken(pub);
     res.json({ user: pub, token, requirePasswordChange: !!user.must_change_password });

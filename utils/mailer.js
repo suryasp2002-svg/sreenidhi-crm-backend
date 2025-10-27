@@ -58,4 +58,35 @@ async function sendEmail({ to, cc = [], bcc = [], subject, html, attachments = [
   return info;
 }
 
-module.exports = { sendEmail };
+async function getSmtpStatus() {
+  const cfg = buildTransportConfig();
+  const missing = validateSmtpConfig(cfg);
+  const summary = {
+    configured: missing.length === 0,
+    missing,
+    transport: {
+      host: cfg.host || null,
+      port: cfg.port || null,
+      secure: !!cfg.secure,
+      user: (cfg.auth && cfg.auth.user) || null
+    },
+    verifyOk: false,
+    message: ''
+  };
+  if (summary.configured) {
+    try {
+      const transporter = nodemailer.createTransport(cfg);
+      await transporter.verify();
+      summary.verifyOk = true;
+      summary.message = 'SMTP connection verified';
+    } catch (e) {
+      summary.verifyOk = false;
+      summary.message = e.message || String(e);
+    }
+  } else {
+    summary.message = `Missing ${missing.join(', ')}`;
+  }
+  return summary;
+}
+
+module.exports = { sendEmail, getSmtpStatus };
