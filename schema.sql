@@ -40,6 +40,11 @@ BEGIN
     ) THEN
         EXECUTE 'ALTER TABLE opportunities ADD COLUMN location_url TEXT NULL';
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns WHERE table_name='opportunities' AND column_name='cancellation_reason'
+    ) THEN
+        EXECUTE 'ALTER TABLE opportunities ADD COLUMN cancellation_reason TEXT NULL';
+    END IF;
     -- Drop old CHECK and recreate with expanded allowlist
     IF EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'opportunities_sector_check'
