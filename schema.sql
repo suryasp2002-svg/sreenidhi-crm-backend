@@ -40,15 +40,15 @@ BEGIN
             EXECUTE 'ALTER TABLE opportunities DROP CONSTRAINT opportunities_sector_check';
         EXCEPTION WHEN others THEN NULL; END;
     END IF;
-    BEGIN
-        EXECUTE $$ALTER TABLE opportunities
-                 ADD CONSTRAINT opportunities_sector_check
-                 CHECK (
-                   sector IS NULL OR sector IN (
-                     'CONSTRUCTION','MINING','HOSPITAL & HEALTHCARE','COMMERCIAL','INSTITUTIONAL','LOGISTICS','INDUSTRIAL','RESIDENTIAL','AGRICULTURE','OTHER'
-                   )
-                 )$$;
-    EXCEPTION WHEN others THEN NULL; END;
+        BEGIN
+                EXECUTE 'ALTER TABLE opportunities
+                                 ADD CONSTRAINT opportunities_sector_check
+                                 CHECK (
+                                     sector IS NULL OR sector IN (
+                                         ''CONSTRUCTION'',''MINING'',''HOSPITAL & HEALTHCARE'',''COMMERCIAL'',''INSTITUTIONAL'',''LOGISTICS'',''INDUSTRIAL'',''RESIDENTIAL'',''AGRICULTURE'',''OTHER''
+                                     )
+                                 )';
+        EXCEPTION WHEN others THEN NULL; END;
 END $$;
 
 CREATE TABLE IF NOT EXISTS customers (
