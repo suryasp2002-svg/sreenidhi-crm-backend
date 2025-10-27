@@ -1,5 +1,8 @@
 -- PostgreSQL schema for Sreenidhi CRM
 
+-- Ensure required extensions (for gen_random_uuid)
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- Base tables (use IF NOT EXISTS to avoid errors if already present)
 CREATE TABLE IF NOT EXISTS opportunities (
     opportunity_id VARCHAR(20) PRIMARY KEY,
