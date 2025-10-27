@@ -2777,9 +2777,41 @@ app.get('/api/employee-overview', requireAuth, requireRole('OWNER','ADMIN'), asy
   }
 });
 
-const server = app.listen(process.env.PORT || 5000, () => {
-  console.log('Server running on port', process.env.PORT || 5000);
-});
+// Optional: auto-run schema migration at boot when enabled via env
+async function autoMigrateIfEnabled() {
+  const flag = String(process.env.AUTO_MIGRATE || process.env.MIGRATE_ON_START || '').toLowerCase();
+  const enabled = flag === '1' || flag === 'true' || flag === 'yes' || flag === 'on';
+  if (!enabled) return;
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const pool = require('./db');
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const sql = fs.readFileSync(schemaPath, 'utf8');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(sql);
+      await client.query('COMMIT');
+      console.log('[auto-migrate] schema.sql applied successfully');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error('[auto-migrate] failed:', e.message);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('[auto-migrate] error:', e.message);
+  }
+}
+
+let server;
+(async () => {
+  await autoMigrateIfEnabled();
+  server = app.listen(process.env.PORT || 5000, () => {
+    console.log('Server running on port', process.env.PORT || 5000);
+  });
+})();
 // Graceful shutdown to avoid data loss
 function shutdown(signal) {
   console.log(`\n[${signal}] Shutting down gracefully...`);
