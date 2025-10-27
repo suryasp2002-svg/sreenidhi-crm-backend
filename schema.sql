@@ -152,9 +152,20 @@ CREATE INDEX IF NOT EXISTS idx_opportunities_sector ON opportunities(sector);
 
 -- Ensure the sequence for expenses.id is in sync with current max(id)
 DO $$
+DECLARE
+    seq_name text;
+    cur_max integer;
 BEGIN
-    IF pg_get_serial_sequence('expenses','id') IS NOT NULL THEN
-        PERFORM setval(pg_get_serial_sequence('expenses','id'), (SELECT COALESCE(MAX(id), 0) FROM expenses), true);
+    seq_name := pg_get_serial_sequence('expenses','id');
+    IF seq_name IS NOT NULL THEN
+        SELECT MAX(id) INTO cur_max FROM expenses;
+        IF cur_max IS NULL OR cur_max < 1 THEN
+            -- No rows yet: set to 1 and mark is_called=false so nextval() returns 1
+            PERFORM setval(seq_name, 1, false);
+        ELSE
+            -- Existing rows: set to current max and mark as called so nextval() returns max+1
+            PERFORM setval(seq_name, cur_max, true);
+        END IF;
     END IF;
 END $$;
 
