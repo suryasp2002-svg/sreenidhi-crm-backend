@@ -1085,15 +1085,14 @@ END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_photos_user ON public.user_photos(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_photos_created_at ON public.user_photos(created_at DESC);
 
--- Ensure exactly one OWNER enforcement (soft - we will enforce in app logic; DB level optional)
--- A partial unique index to allow only one active OWNER
+-- Allow multiple OWNER accounts: drop legacy unique constraint if it exists
 DO $$
 BEGIN
-    IF NOT EXISTS (
+    IF EXISTS (
         SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'uniq_active_owner'
     ) THEN
         BEGIN
-            EXECUTE 'CREATE UNIQUE INDEX uniq_active_owner ON users ((role)) WHERE role = ''OWNER'' AND active = TRUE';
+            EXECUTE 'DROP INDEX IF EXISTS uniq_active_owner';
         EXCEPTION WHEN others THEN NULL; END;
     END IF;
 END $$;
