@@ -11,6 +11,7 @@ const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const hpp = require('hpp');
 const app = express();
+const { randomUUID } = require('crypto');
 app.set('trust proxy', 1);
 // Security and performance middlewares
 app.use(helmet({
@@ -100,13 +101,9 @@ async function ensureUserFullProfilesView(db) {
 // Self-healing minimal schema to guarantee new columns/tables exist in current DB
 async function ensureMinimalSchema(db) {
   try {
-    // Ensure pgcrypto for gen_random_uuid (needed by users.id default)
-    try {
-      await db.query("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-    } catch (e) {
-      // Non-fatal on providers that restrict CREATE EXTENSION
-      if (!process.env.SUPPRESS_DB_LOG) console.warn('[ensureMinimalSchema] pgcrypto warn:', e.message);
-    }
+    // Attempt pgcrypto enable; ignore if provider blocks extensions
+    try { await db.query("CREATE EXTENSION IF NOT EXISTS pgcrypto"); }
+    catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[ensureMinimalSchema] pgcrypto warn:', e.message); }
 
     // opportunities.sector and opportunities.location_url
     await db.query("ALTER TABLE public.opportunities ADD COLUMN IF NOT EXISTS sector TEXT NULL");
@@ -133,7 +130,7 @@ async function ensureMinimalSchema(db) {
     // Minimal users table to unblock auth if migrations haven't run yet
     await db.query(`
       CREATE TABLE IF NOT EXISTS public.users (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        id UUID PRIMARY KEY,
         email TEXT NOT NULL UNIQUE,
         username TEXT UNIQUE,
         full_name TEXT,
@@ -2870,9 +2867,10 @@ app.post('/api/auth/register-initial', async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
     if (await ownerExists()) return res.status(400).json({ error: 'Owner already exists' });
     const pwHash = await hashPassword(password);
+    const newId = randomUUID();
     const r = await pool.query(
-      'INSERT INTO public.users (email, full_name, role, password_hash, must_change_password) VALUES ($1,$2,$3,$4,$5) RETURNING id, email, full_name, role, created_at',
-      [String(email).toLowerCase(), full_name || null, 'OWNER', pwHash, false]
+      'INSERT INTO public.users (id, email, full_name, role, password_hash, must_change_password) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, email, full_name, role, created_at',
+      [newId, String(email).toLowerCase(), full_name || null, 'OWNER', pwHash, false]
     );
     const user = r.rows[0];
     const token = signToken(user);
@@ -2992,9 +2990,10 @@ app.post('/api/users', requireAuth, requireRole('OWNER','ADMIN'), async (req, re
       if (existsU.rows.length) return res.status(409).json({ error: 'Username already in use' });
     }
     const pwHash = await hashPassword(password);
+    const newId = randomUUID();
     const ins = await pool.query(
-      'INSERT INTO public.users (email, username, phone, full_name, role, password_hash, must_change_password, joining_date, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, email, username, phone, full_name, role, created_at, joining_date, status',
-      [email ? String(email).toLowerCase() : null, username || null, phone || null, full_name || null, rRole, pwHash, true, joining_date || null, status || 'ACTIVE']
+      'INSERT INTO public.users (id, email, username, phone, full_name, role, password_hash, must_change_password, joining_date, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id, email, username, phone, full_name, role, created_at, joining_date, status',
+      [newId, email ? String(email).toLowerCase() : null, username || null, phone || null, full_name || null, rRole, pwHash, true, joining_date || null, status || 'ACTIVE']
     );
     res.status(201).json(ins.rows[0]);
   } catch (err) {

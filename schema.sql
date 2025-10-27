@@ -1,7 +1,15 @@
 -- PostgreSQL schema for Sreenidhi CRM
 
--- Ensure required extensions (for gen_random_uuid)
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- Try to enable pgcrypto for gen_random_uuid(); ignore if not permitted by provider
+DO $$
+BEGIN
+    BEGIN
+        CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    EXCEPTION WHEN others THEN
+        -- Some managed providers block CREATE EXTENSION; proceed without it
+        NULL;
+    END;
+END $$;
 
 -- Base tables (use IF NOT EXISTS to avoid errors if already present)
 CREATE TABLE IF NOT EXISTS opportunities (
@@ -823,7 +831,7 @@ END $$;
 
 -- =====================
 CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     username TEXT UNIQUE,
     full_name TEXT,
