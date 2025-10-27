@@ -100,6 +100,14 @@ async function ensureUserFullProfilesView(db) {
 // Self-healing minimal schema to guarantee new columns/tables exist in current DB
 async function ensureMinimalSchema(db) {
   try {
+    // Ensure pgcrypto for gen_random_uuid (needed by users.id default)
+    try {
+      await db.query("CREATE EXTENSION IF NOT EXISTS pgcrypto");
+    } catch (e) {
+      // Non-fatal on providers that restrict CREATE EXTENSION
+      if (!process.env.SUPPRESS_DB_LOG) console.warn('[ensureMinimalSchema] pgcrypto warn:', e.message);
+    }
+
     // opportunities.sector and opportunities.location_url
     await db.query("ALTER TABLE public.opportunities ADD COLUMN IF NOT EXISTS sector TEXT NULL");
     await db.query("ALTER TABLE public.opportunities ADD COLUMN IF NOT EXISTS location_url TEXT NULL");
@@ -121,6 +129,26 @@ async function ensureMinimalSchema(db) {
     await db.query("CREATE INDEX IF NOT EXISTS idx_customers_client_name ON public.customers(client_name)");
     await db.query("CREATE INDEX IF NOT EXISTS idx_contracts_created_at ON public.contracts(created_at DESC)");
     await db.query("CREATE INDEX IF NOT EXISTS idx_contracts_client_name ON public.contracts(client_name)");
+
+    // Minimal users table to unblock auth if migrations haven't run yet
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email TEXT NOT NULL UNIQUE,
+        username TEXT UNIQUE,
+        full_name TEXT,
+        role TEXT NOT NULL CHECK (role IN ('OWNER','ADMIN','EMPLOYEE')),
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        last_login TIMESTAMP WITHOUT TIME ZONE,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        phone TEXT,
+        must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+        last_password_change_at TIMESTAMP WITHOUT TIME ZONE
+      )
+    `);
+    await db.query("CREATE INDEX IF NOT EXISTS idx_users_role ON public.users(role)");
+    await db.query("CREATE INDEX IF NOT EXISTS idx_users_active ON public.users(active)");
   } catch (e) {
     console.warn('[ensureMinimalSchema] warning:', e.message);
   }
