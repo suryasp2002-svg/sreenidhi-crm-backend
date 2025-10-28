@@ -35,7 +35,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '7mb' }));
 app.use(express.urlencoded({ extended: true, limit: '7mb' }));
 // Utilities for mail and calendar
-const { sendEmail } = require('./utils/mailer');
+const { sendEmail, verifySmtp } = require('./utils/mailer');
 const { generateICS, generateGoogleCalendarLink } = require('./utils/calendar');
 const { meetingEmailHtml } = require('./utils/templates/meetingEmail');
 const { hashPassword, verifyPassword, signToken, requireAuth, requireRole, ownerExists } = require('./auth');
@@ -350,6 +350,16 @@ app.get('/api/diagnostics/email-config', (req, res) => {
     res.json({ configured: missing.length === 0, missing, configPreview: cfg });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// Diagnostics: verify SMTP connectivity/auth (no secrets in response)
+app.get('/api/diagnostics/email-verify', async (req, res) => {
+  try {
+    const r = await verifySmtp();
+    res.json({ ok: true, verified: !!r.ok });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message, code: e.code || null });
   }
 });
 

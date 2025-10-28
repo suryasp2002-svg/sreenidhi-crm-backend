@@ -24,7 +24,12 @@ function buildTransportConfig() {
   const rejectUnauthorized = process.env.SMTP_TLS_REJECT_UNAUTHORIZED === undefined
     ? true
     : getBool(process.env.SMTP_TLS_REJECT_UNAUTHORIZED, true);
-  const cfg = { host, port, secure, auth: { user, pass } };
+  // Conservative timeouts to ensure HTTP request doesn't hang forever
+  const connectionTimeout = Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 20000); // 20s
+  const socketTimeout = Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 25000); // 25s
+  const greetingTimeout = Number(process.env.SMTP_GREETING_TIMEOUT_MS || 15000); // 15s
+
+  const cfg = { host, port, secure, auth: { user, pass }, connectionTimeout, socketTimeout, greetingTimeout };
   if (requireTLS) cfg.requireTLS = true;
   if (ignoreTLS) cfg.ignoreTLS = true;
   cfg.tls = { ...(cfg.tls || {}), rejectUnauthorized };
@@ -68,4 +73,16 @@ async function sendEmail({ to, cc = [], bcc = [], subject, html, attachments = [
   return info;
 }
 
-module.exports = { sendEmail };
+async function verifySmtp() {
+  const transporter = createTransporter();
+  try {
+    const result = await transporter.verify();
+    return { ok: !!result };
+  } catch (e) {
+    const err = new Error(e && e.message ? e.message : 'SMTP verify failed');
+    err.code = e && e.code;
+    throw err;
+  }
+}
+
+module.exports = { sendEmail, verifySmtp };
