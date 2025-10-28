@@ -18,7 +18,17 @@ function buildTransportConfig() {
     port = 465;
     secure = true;
   }
-  return { host, port, secure, auth: { user, pass } };
+  // Optional TLS knobs for tricky providers
+  const requireTLS = getBool(process.env.SMTP_REQUIRE_TLS, false);
+  const ignoreTLS = getBool(process.env.SMTP_IGNORE_TLS, false);
+  const rejectUnauthorized = process.env.SMTP_TLS_REJECT_UNAUTHORIZED === undefined
+    ? true
+    : getBool(process.env.SMTP_TLS_REJECT_UNAUTHORIZED, true);
+  const cfg = { host, port, secure, auth: { user, pass } };
+  if (requireTLS) cfg.requireTLS = true;
+  if (ignoreTLS) cfg.ignoreTLS = true;
+  cfg.tls = { ...(cfg.tls || {}), rejectUnauthorized };
+  return cfg;
 }
 
 function validateSmtpConfig(cfg) {
@@ -58,35 +68,4 @@ async function sendEmail({ to, cc = [], bcc = [], subject, html, attachments = [
   return info;
 }
 
-async function getSmtpStatus() {
-  const cfg = buildTransportConfig();
-  const missing = validateSmtpConfig(cfg);
-  const summary = {
-    configured: missing.length === 0,
-    missing,
-    transport: {
-      host: cfg.host || null,
-      port: cfg.port || null,
-      secure: !!cfg.secure,
-      user: (cfg.auth && cfg.auth.user) || null
-    },
-    verifyOk: false,
-    message: ''
-  };
-  if (summary.configured) {
-    try {
-      const transporter = nodemailer.createTransport(cfg);
-      await transporter.verify();
-      summary.verifyOk = true;
-      summary.message = 'SMTP connection verified';
-    } catch (e) {
-      summary.verifyOk = false;
-      summary.message = e.message || String(e);
-    }
-  } else {
-    summary.message = `Missing ${missing.join(', ')}`;
-  }
-  return summary;
-}
-
-module.exports = { sendEmail, getSmtpStatus };
+module.exports = { sendEmail };

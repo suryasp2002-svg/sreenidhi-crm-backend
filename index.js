@@ -35,7 +35,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '7mb' }));
 app.use(express.urlencoded({ extended: true, limit: '7mb' }));
 // Utilities for mail and calendar
-const { sendEmail, getSmtpStatus } = require('./utils/mailer');
+const { sendEmail } = require('./utils/mailer');
 const { generateICS, generateGoogleCalendarLink } = require('./utils/calendar');
 const { meetingEmailHtml } = require('./utils/templates/meetingEmail');
 const { hashPassword, verifyPassword, signToken, requireAuth, requireRole, ownerExists } = require('./auth');
@@ -331,15 +331,23 @@ app.post('/api/diagnostics/refresh-features', async (req, res) => {
   }
 });
 
-// Diagnostics: SMTP/email configuration status (no auth)
-app.get('/api/diagnostics/email-config', async (req, res) => {
+// Diagnostics: email configuration status (no secrets)
+app.get('/api/diagnostics/email-config', (req, res) => {
   try {
-    const status = await getSmtpStatus();
-    res.json({
-      ...status,
-      apiOrigin: process.env.API_ORIGIN || null,
-      mailFrom: process.env.MAIL_FROM || (process.env.SMTP_USER || null)
-    });
+    const cfg = {
+      host: process.env.SMTP_HOST || (process.env.SMTP_USER && /@gmail\.com$/i.test(String(process.env.SMTP_USER)) ? 'smtp.gmail.com' : undefined),
+      port: Number(process.env.SMTP_PORT || (process.env.SMTP_USER && /@gmail\.com$/i.test(String(process.env.SMTP_USER)) ? 465 : 587)),
+      secure: !!(String(process.env.SMTP_SECURE || (process.env.SMTP_USER && /@gmail\.com$/i.test(String(process.env.SMTP_USER)) ? 'true' : 'false')).match(/^(1|true|yes|on)$/i)),
+      userPresent: !!process.env.SMTP_USER,
+      passPresent: !!process.env.SMTP_PASS,
+      from: process.env.MAIL_FROM || process.env.SMTP_USER || null,
+      apiOrigin: process.env.API_ORIGIN || null
+    };
+    const missing = [];
+    if (!cfg.host) missing.push('SMTP_HOST');
+    if (!cfg.userPresent) missing.push('SMTP_USER');
+    if (!cfg.passPresent) missing.push('SMTP_PASS');
+    res.json({ configured: missing.length === 0, missing, configPreview: cfg });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
