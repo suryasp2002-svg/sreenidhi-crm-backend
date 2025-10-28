@@ -2549,6 +2549,12 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
       const info = await sendEmail({ to: toList, cc: ccList, bcc: bccList, subject, html, attachments });
       return res.json({ ok: true, messageId: info.messageId });
     } catch (e) {
+      // Log detailed error to server logs for diagnostics (avoids leaking secrets to clients)
+      try {
+        const code = e && e.code;
+        const response = e && (e.response || e.responseCode || e.command || e.reason || e.stack || e.message);
+        console.error('[email/send] sendMail failed:', code, response);
+      } catch {}
       // Provide a user-friendly error for missing SMTP config
       const msg = e && e.code === 'SMTP_CONFIG_MISSING' ? e.message : (e.message || 'Email send failed');
       return res.status(500).json({ error: msg });
