@@ -18,7 +18,11 @@ function meetingEmailHtml(meeting) {
   const outlookUrl = generateOutlookCalendarLink(meeting);
   const teamsUrl = generateTeamsLink(meeting);
   const api = process.env.API_ORIGIN || '';
-  const logoUrl = process.env.EMAIL_LOGO_URL || '';
+  const isProd = (process.env.NODE_ENV || '').toLowerCase() === 'production';
+  // Prefer an explicit email-safe absolute URL; else try site origin; else dev localhost; else relative for preview
+  const ui = process.env.SITE_ORIGIN || process.env.FRONTEND_ORIGIN || (!isProd ? 'http://localhost:3000' : '');
+  const logoUrl = process.env.EMAIL_LOGO_URL
+    || (ui ? `${ui.replace(/\/$/, '')}/assets/branding/logo.png` : '/assets/branding/logo.png');
   const icsUrl = `${api}/api/meetings/${encodeURIComponent(id)}/ics`;
   // Prefer webcal:// scheme for Apple to open Calendar app on iOS when API_ORIGIN is a real host
   const preferWebcal = api && !/^(https?:\/\/)?(localhost|127\.0\.0\.1)(:|$)/i.test(api);
