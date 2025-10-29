@@ -56,12 +56,21 @@ function createTransporter() {
   return nodemailer.createTransport(cfg);
 }
 
-async function sendEmail({ to, cc = [], bcc = [], subject, html, attachments = [] }) {
-  if (!to || (Array.isArray(to) && to.length === 0)) {
-    throw new Error('No recipients provided');
+function parseFromAddress(str) {
+  const s = String(str || '').trim();
+  if (!s) return { email: null, name: null, raw: null };
+  const m = s.match(/^(.*)<([^>]+)>$/);
+  if (m) {
+    const name = m[1].trim().replace(/^"|"$/g, '') || null;
+    const email = m[2].trim();
+    return { email, name, raw: s };
   }
+  return { email: s, name: null, raw: s };
+}
+
+async function sendViaSmtp({ to, cc, bcc, subject, html, attachments }) {
   const transporter = createTransporter();
-  const info = await transporter.sendMail({
+  return await transporter.sendMail({
     from: process.env.MAIL_FROM || process.env.SMTP_USER,
     to: Array.isArray(to) ? to.join(',') : to,
     cc: cc && cc.length ? (Array.isArray(cc) ? cc.join(',') : cc) : undefined,
@@ -70,7 +79,59 @@ async function sendEmail({ to, cc = [], bcc = [], subject, html, attachments = [
     html,
     attachments,
   });
-  return info;
+}
+
+async function sendViaSendGrid({ to, cc, bcc, subject, html, attachments }) {
+  const key = process.env.SENDGRID_API_KEY;
+  if (!key) throw new Error('SENDGRID_API_KEY not set');
+  const fromRaw = process.env.MAIL_FROM || process.env.SMTP_USER;
+  const from = parseFromAddress(fromRaw);
+  const toList = (Array.isArray(to) ? to : String(to).split(',')).filter(Boolean).map(e => ({ email: String(e).trim() }));
+  const ccList = (cc && (Array.isArray(cc) ? cc : String(cc).split(','))).filter(Boolean).map(e => ({ email: String(e).trim() }));
+  const bccList = (bcc && (Array.isArray(bcc) ? bcc : String(bcc).split(','))).filter(Boolean).map(e => ({ email: String(e).trim() }));
+  const body = {
+    personalizations: [{ to: toList, ...(ccList.length ? { cc: ccList } : {}), ...(bccList.length ? { bcc: bccList } : {}) }],
+    from: from.name ? { email: from.email, name: from.name } : { email: from.email },
+    subject,
+    content: [{ type: 'text/html', value: html || '' }],
+  };
+  if (getBool(process.env.SENDGRID_SANDBOX, false)) {
+    body.mail_settings = { sandbox_mode: { enable: true } };
+  }
+  if (attachments && attachments.length) {
+    body.attachments = attachments.map(att => ({
+      content: Buffer.isBuffer(att.content) ? att.content.toString('base64') : Buffer.from(String(att.content || ''), 'utf8').toString('base64'),
+      type: att.contentType || 'application/octet-stream',
+      filename: att.filename || 'attachment',
+      disposition: 'attachment',
+    }));
+  }
+  const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (res.status >= 200 && res.status < 300) {
+    return { messageId: res.headers.get('x-message-id') || null, provider: 'sendgrid' };
+  }
+  const text = await res.text().catch(() => '');
+  const err = new Error(`SendGrid API ${res.status}: ${text}`);
+  err.code = 'EMAIL_API_ERROR';
+  throw err;
+}
+
+async function sendEmail({ to, cc = [], bcc = [], subject, html, attachments = [] }) {
+  if (!to || (Array.isArray(to) && to.length === 0)) {
+    throw new Error('No recipients provided');
+  }
+  // If an email API key is present, prefer it (avoids SMTP egress blocks)
+  if (process.env.SENDGRID_API_KEY) {
+    return await sendViaSendGrid({ to, cc, bcc, subject, html, attachments });
+  }
+  return await sendViaSmtp({ to, cc, bcc, subject, html, attachments });
 }
 
 async function verifySmtp() {

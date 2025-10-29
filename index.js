@@ -341,7 +341,8 @@ app.get('/api/diagnostics/email-config', (req, res) => {
       userPresent: !!process.env.SMTP_USER,
       passPresent: !!process.env.SMTP_PASS,
       from: process.env.MAIL_FROM || process.env.SMTP_USER || null,
-      apiOrigin: process.env.API_ORIGIN || null
+      apiOrigin: process.env.API_ORIGIN || null,
+      provider: process.env.SENDGRID_API_KEY ? 'sendgrid-api' : 'smtp'
     };
     const missing = [];
     if (!cfg.host) missing.push('SMTP_HOST');
