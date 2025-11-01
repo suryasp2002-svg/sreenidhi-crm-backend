@@ -173,8 +173,8 @@ function buildOpportunitySelectFields(includeSpend = true) {
 // Helper to derive a human-readable actor label for audit logs
 function getActor(req) {
   if (req && req.user) {
-    // Prefer email, then username for canonical comparisons
-    return req.user.email || req.user.username || req.user.sub || 'user';
+    // Prefer username for display/canonical text, fall back to email
+    return req.user.username || req.user.email || req.user.sub || 'user';
   }
   return 'user';
 }
@@ -224,7 +224,8 @@ async function resolveUserByIdentifier(val) {
 
 function pickDisplay(u) {
   if (!u) return null;
-  return u.email || u.username || u.full_name || null;
+  // Always prefer username for compact labels; fallback to full_name, then email
+  return u.username || u.full_name || u.email || null;
 }
 
 // ------------ Validators: PAN and Aadhaar -------------
@@ -506,14 +507,14 @@ app.post('/api/targets', requireAuth, requireRole('OWNER','ADMIN','EMPLOYEE'), a
     if (role === 'EMPLOYEE') {
       assignedUserId = actorUserId;
       const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [actorUserId]);
-      assignedLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : actor;
+      assignedLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : actor;
     } else {
       if (assignedToUserId) {
         const valid = await validateSelectableUserId(pool, String(assignedToUserId));
         if (!valid) return res.status(400).json({ error: 'Invalid assignedToUserId' });
         assignedUserId = valid;
         const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [valid]);
-        assignedLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : null;
+        assignedLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : null;
       } else if (assigned_to) {
         const u = await resolveUserByIdentifier(assigned_to);
         if (u) { assignedUserId = u.id; assignedLabel = pickDisplay(u); }
@@ -521,7 +522,7 @@ app.post('/api/targets', requireAuth, requireRole('OWNER','ADMIN','EMPLOYEE'), a
       if (!assignedUserId) {
         assignedUserId = actorUserId;
         const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [actorUserId]);
-        assignedLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : actor;
+        assignedLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : actor;
       }
     }
     const sql = `INSERT INTO targets (id, client_name, notes, status, assigned_to, assigned_to_user_id, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW()) RETURNING *`;
@@ -554,14 +555,14 @@ app.put('/api/targets/:id', requireAuth, requireRole('OWNER','ADMIN','EMPLOYEE')
     if (role === 'EMPLOYEE') {
       assignedUserId = actorUserId;
       const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [actorUserId]);
-      assignedLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : actor;
+      assignedLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : actor;
     } else {
       if (assignedToUserId) {
         const valid = await validateSelectableUserId(pool, String(assignedToUserId));
         if (!valid) return res.status(400).json({ error: 'Invalid assignedToUserId' });
         assignedUserId = valid;
         const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [valid]);
-        assignedLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : null;
+        assignedLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : null;
       } else if (assigned_to !== undefined) {
         const u = assigned_to ? await resolveUserByIdentifier(assigned_to) : null;
         if (u) { assignedUserId = u.id; assignedLabel = pickDisplay(u); }
@@ -2292,9 +2293,13 @@ app.get('/api/reminders', requireAuth, async (req, res) => {
       SELECT r.*,
              uc.full_name AS created_by_full_name,
              uc.username AS created_by_username,
-             uc.email AS created_by_email
+             uc.email   AS created_by_email,
+             ua.full_name AS assigned_to_full_name,
+             ua.username  AS assigned_to_username,
+             ua.email     AS assigned_to_email
       FROM reminders r
       LEFT JOIN public.users uc ON uc.id = r.created_by_user_id
+      LEFT JOIN public.users ua ON ua.id = r.assigned_to_user_id
       ${where}
       ${order}
       LIMIT ${s} OFFSET ${offset}
@@ -2370,20 +2375,20 @@ app.post('/api/reminders', requireAuth, async (req, res) => {
     if (req.user && req.user.role === 'EMPLOYEE' && !assignedToUserId && !assigned_to) {
       assigneeUserId = actorUserId;
       const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [actorUserId]);
-      assigneeLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : getActor(req);
+      assigneeLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : getActor(req);
     }
     if (assignedToUserId) {
       // Allow self-assignment for any role, including ADMIN
       if (req.user && String(assignedToUserId) === String(req.user.sub)) {
         assigneeUserId = req.user.sub;
         const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [assigneeUserId]);
-        assigneeLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : getActor(req);
+        assigneeLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : getActor(req);
       } else {
         const valid = await validateSelectableUserId(pool, String(assignedToUserId));
         if (!valid) return res.status(400).json({ error: 'Invalid assignedToUserId' });
         assigneeUserId = valid;
         const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [valid]);
-        assigneeLabel = rr.rows.length ? (rr.rows[0].email || rr.rows[0].username || rr.rows[0].full_name) : null;
+        assigneeLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : null;
       }
     } else if (assigned_to) {
       // Best-effort resolve by identifier
@@ -2592,7 +2597,7 @@ app.put('/api/reminders/:id', requireAuth, async (req, res) => {
     }
     const row = cur.rows[0];
     const type = String(row.type || '').toUpperCase();
-    let { title, due_ts, notes, status, receiver_email, recipient_email, person_name, phone, notify_at } = req.body || {};
+    let { title, due_ts, notes, status, receiver_email, recipient_email, person_name, phone, notify_at, assignedToUserId, assigned_to } = req.body || {};
     title = title !== undefined ? String(title || '').trim() : row.title;
     notes = notes !== undefined ? (notes || null) : row.notes;
     // Parse dates if provided (as LOCAL time)
@@ -2640,12 +2645,37 @@ app.put('/api/reminders/:id', requireAuth, async (req, res) => {
     if (type === 'CALL') {
       if (!phone) return res.status(400).json({ error: 'phone is required for CALL reminders' });
     }
+    // Normalize and optionally update assignee
+    // Policy: The creator (any role) may reassign their own reminder to any selectable user.
+    // OWNER/ADMIN may reassign any reminder. EMPLOYEE is already restricted above to only edit reminders they created.
+    let newAssignedUserId = row.assigned_to_user_id || null;
+    let newAssignedLabel = row.assigned_to || null;
+    if (assignedToUserId !== undefined && assignedToUserId) {
+      const valid = await validateSelectableUserId(pool, String(assignedToUserId));
+      if (!valid) return res.status(400).json({ error: 'Invalid assignedToUserId' });
+      newAssignedUserId = valid;
+      const rr = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [valid]);
+      newAssignedLabel = rr.rows.length ? pickDisplay(rr.rows[0]) : newAssignedLabel;
+    } else if (assigned_to !== undefined) {
+      if (assigned_to === null) {
+        newAssignedUserId = null;
+        newAssignedLabel = null;
+      } else {
+        const u = await resolveUserByIdentifier(assigned_to);
+        if (u) {
+          newAssignedUserId = u.id;
+          newAssignedLabel = pickDisplay(u);
+        } else {
+          newAssignedLabel = String(assigned_to).trim() || null;
+        }
+      }
+    }
     // Build update
     const updated = await pool.query(
       `UPDATE reminders
-       SET title=$1, due_ts=$2, notes=$3, status=$4, notify_at=$5, receiver_email=$6, person_name=$7, phone=$8
-       WHERE id=$9 RETURNING *`,
-      [title, dueDate ? normalizeLocal(dueDate) : row.due_ts, notes, status, notifyAtDate ? normalizeLocal(notifyAtDate) : row.notify_at, receiver_email || null, person_name, phone || null, id]
+       SET title=$1, due_ts=$2, notes=$3, status=$4, notify_at=$5, receiver_email=$6, person_name=$7, phone=$8, assigned_to=$9, assigned_to_user_id=$10
+       WHERE id=$11 RETURNING *`,
+      [title, dueDate ? normalizeLocal(dueDate) : row.due_ts, notes, status, notifyAtDate ? normalizeLocal(notifyAtDate) : row.notify_at, receiver_email || null, person_name, phone || null, newAssignedLabel, newAssignedUserId, id]
     );
     res.json(updated.rows[0]);
   } catch (err) {
@@ -2907,9 +2937,10 @@ app.post('/api/auth/register-initial', async (req, res) => {
     if (await ownerExists()) return res.status(400).json({ error: 'Owner already exists' });
     const pwHash = await hashPassword(password);
     const newId = randomUUID();
+    const uname = String(email).toLowerCase().split('@')[0];
     const r = await pool.query(
-      'INSERT INTO public.users (id, email, full_name, role, password_hash, must_change_password) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, email, full_name, role, created_at',
-      [newId, String(email).toLowerCase(), full_name || null, 'OWNER', pwHash, false]
+      'INSERT INTO public.users (id, email, username, full_name, role, password_hash, must_change_password) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, email, username, full_name, role, created_at',
+      [newId, String(email).toLowerCase(), uname, full_name || null, 'OWNER', pwHash, false]
     );
     const user = r.rows[0];
     const token = signToken(user);
@@ -3004,7 +3035,8 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 app.post('/api/users', requireAuth, requireRole('OWNER','ADMIN'), async (req, res) => {
   try {
     const { email, username, phone, password, role, full_name, joining_date, status } = req.body || {};
-    if ((!email && !username) || !password || !role) return res.status(400).json({ error: 'username/email, password, role required' });
+    // Enforce username mandatory (email optional)
+    if (!username || !password || !role) return res.status(400).json({ error: 'username, password, role required' });
     const rRole = role.toUpperCase();
     // Creator-based role constraints
     const creator = req.user; // { sub, role }
@@ -3144,7 +3176,8 @@ app.post('/api/users/:id/password-reset', requireAuth, requireRole('OWNER','ADMI
     try {
       const actorId = req.user && req.user.sub;
       const actorRole = req.user && req.user.role;
-      const actor = (req.user && (req.user.email || req.user.username)) || getActor(req);
+      // Username-first policy for audit actor label
+      const actor = (req.user && (req.user.username || req.user.full_name || req.user.email)) || getActor(req);
       await pool.query(
         `INSERT INTO public.users_password_audit (
            target_user_id, target_email, target_username, target_full_name, target_role,

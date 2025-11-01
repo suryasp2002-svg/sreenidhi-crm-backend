@@ -7,6 +7,8 @@
     "start": "node index.js",
     "migrate": "node migrate.js",
     "fix:assignees": "node scripts/normalize_assignees.js",
+  "users:backfill-usernames": "node scripts/backfill_usernames.js",
+    "schema:list": "node scripts/list_schema.js",
     "seed:owner": "node scripts/seed_owner.js",
     "import:users": "node scripts/import_users_from_dump.js",
     "import:all": "node scripts/import_all_from_dump.js",
