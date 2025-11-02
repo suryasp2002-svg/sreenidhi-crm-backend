@@ -1,4 +1,4 @@
-const { createEvent } = require('ics');
+const { createEvent, createEvents } = require('ics');
 
 function toParts(d) {
   const dt = new Date(d);
@@ -80,3 +80,51 @@ function generateTeamsLink(meeting) {
 }
 
 module.exports = { generateICS, generateGoogleCalendarLink, generateOutlookCalendarLink, generateTeamsLink };
+
+// --- Multi-event helpers for reminders ---
+
+function sanitizeText(s) {
+  if (!s) return '';
+  return String(s).replace(/[\n\r]+/g, ' ').trim();
+}
+
+function buildIcsEventFromReminder(rem) {
+  // rem: { title, client_name, person_name, when, location?, notes?, type }
+  const start = toParts(rem.when);
+  // Default 30 minutes duration for reminders in calendars
+  const endDate = new Date(rem.when ? new Date(rem.when).getTime() + 30 * 60 * 1000 : Date.now());
+  const end = toParts(endDate);
+  const title = `${sanitizeText(rem.type || rem.kind || 'Reminder')}: ${sanitizeText(rem.title || '')}`.trim();
+  const client = sanitizeText(rem.client_name || '');
+  const person = sanitizeText(rem.person_name || '');
+  const phone = sanitizeText(rem.phone || '');
+  const notes = sanitizeText(rem.notes || '');
+  const description = [
+    client && `Client: ${client}`,
+    person && `Person: ${person}`,
+    phone && `Phone: ${phone}`,
+    notes && `Notes: ${notes}`
+  ].filter(Boolean).join('\n');
+  const uid = `REM-${(rem.id || '').toString()}` || `REM-${Math.random().toString(36).slice(2)}`;
+  return { start, end, uid, title: client ? `${title} – ${client}` : title, description };
+}
+
+function generateICSMultiForReminders(reminders) {
+  const events = reminders.map(buildIcsEventFromReminder);
+  return new Promise((resolve, reject) => {
+    createEvents(events, { calName: 'Sreenidhi Reminders', productId: 'Sreenidhi CRM' }, (err, value) => {
+      if (err) return reject(err);
+      resolve(value);
+    });
+  });
+}
+
+function generateGoogleImportByIcsUrl(icsUrl) {
+  // Google supports adding by URL using 'cid' parameter (creates a subscribed calendar from ICS URL)
+  if (!icsUrl) return '';
+  const params = new URLSearchParams({ cid: icsUrl });
+  return `https://calendar.google.com/calendar/r?${params.toString()}`;
+}
+
+module.exports.generateICSMultiForReminders = generateICSMultiForReminders;
+module.exports.generateGoogleImportByIcsUrl = generateGoogleImportByIcsUrl;

@@ -36,8 +36,9 @@ app.use(express.json({ limit: '7mb' }));
 app.use(express.urlencoded({ extended: true, limit: '7mb' }));
 // Utilities for mail and calendar
 const { sendEmail, verifySmtp } = require('./utils/mailer');
-const { generateICS, generateGoogleCalendarLink } = require('./utils/calendar');
+const { generateICS, generateGoogleCalendarLink, generateICSMultiForReminders, generateGoogleImportByIcsUrl } = require('./utils/calendar');
 const { meetingEmailHtml } = require('./utils/templates/meetingEmail');
+const { remindersEmailHtml } = require('./utils/templates/remindersEmail');
 const { hashPassword, verifyPassword, signToken, requireAuth, requireRole, ownerExists } = require('./auth');
 // Feature flags for optional schema parts; refreshed on startup
 const featureFlags = {
@@ -1793,6 +1794,43 @@ app.get('/api/meetings/:id/ics', async (req, res) => {
   }
 });
 
+// Generate a single ICS file containing multiple reminder events (public: used from email buttons)
+// Query: /api/reminders/ics?ids=ID1,ID2,ID3
+app.get('/api/reminders/ics', async (req, res) => {
+  try {
+    const idsParam = String(req.query.ids || '').trim();
+    if (!idsParam) return res.status(400).send('ids query is required');
+    const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean).slice(0, 200);
+    if (!ids.length) return res.status(400).send('No valid ids');
+    const ph = ids.map((_, i) => `$${i + 1}`).join(',');
+    const r = await pool.query(
+      `SELECT id, title, type, notes, due_ts AS when, person_name, phone, client_name
+         FROM reminders
+        WHERE id IN (${ph})
+        ORDER BY due_ts ASC NULLS LAST`, ids);
+    if (!r.rows.length) return res.status(404).send('Not found');
+    const ics = await generateICSMultiForReminders(r.rows.map(row => ({
+      id: row.id,
+      title: row.title,
+      type: row.type,
+      notes: row.notes,
+      when: row.when,
+      person_name: row.person_name,
+      phone: row.phone,
+      client_name: row.client_name
+    })));
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const today = new Date();
+    const ymd = today.toISOString().slice(0,10).replace(/-/g,'');
+    res.setHeader('Content-Disposition', `attachment; filename="reminders-${ymd}.ics"`);
+    return res.send(ics);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('Server error');
+  }
+});
+
 // Create meeting with audit
 app.post('/api/meetings', requireAuth, async (req, res) => {
   let { id, customer_id, opportunity_id, contract_id, subject, starts_at, when_ts, location, person_name, contact_phone, notes, status, assigned_to, assignedToUserId } = req.body || {};
@@ -2514,11 +2552,106 @@ app.post('/api/email/preview/meeting', requireAuth, async (req, res) => {
   }
 });
 
+// Email preview for a selection of reminders (CALL/EMAIL)
+// Body: { reminderIds: string[], includeClientEmails?: boolean }
+app.post('/api/email/preview/reminders', requireAuth, async (req, res) => {
+  try {
+    const { reminderIds, includeClientEmails } = req.body || {};
+    const ids = Array.isArray(reminderIds) ? reminderIds.filter(Boolean).map(String) : [];
+    if (!ids.length) return res.status(400).json({ error: 'reminderIds is required' });
+
+    // Fetch selected reminders
+    const ph = ids.map((_, i) => `$${i + 1}`).join(',');
+    const r = await pool.query(
+      `SELECT id, title, type, status, due_ts, receiver_email, person_name, phone, opportunity_id, client_name,
+              created_by, created_by_user_id, assigned_to, assigned_to_user_id, meeting_id
+         FROM reminders
+        WHERE id IN (${ph})`,
+      ids
+    );
+    const rows = r.rows || [];
+    if (!rows.length) return res.status(404).json({ error: 'No reminders found' });
+
+    // Visibility guard for EMPLOYEE: ensure each selected reminder is visible to current user
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const uid = req.user.sub;
+      // All must satisfy visibility
+      for (const x of rows) {
+        const own = (x.created_by_user_id && String(x.created_by_user_id) === String(uid)) || (x.created_by && String(x.created_by) === String(actor));
+        const assigned = (x.assigned_to_user_id && String(x.assigned_to_user_id) === String(uid)) || (x.assigned_to && String(x.assigned_to) === String(actor));
+        let viaMeeting = false;
+        if (x.meeting_id) {
+          try {
+            const m = await pool.query('SELECT 1 FROM meetings WHERE id=$1 AND (assigned_to_user_id=$2 OR created_by_user_id=$2 OR assigned_to=$3 OR created_by=$3) LIMIT 1', [x.meeting_id, uid, actor]);
+            viaMeeting = m.rows.length > 0;
+          } catch {}
+        }
+        if (!(own || assigned || viaMeeting)) {
+          return res.status(403).json({ error: 'Forbidden for one or more reminders' });
+        }
+      }
+    }
+
+    // Build DTOs for template
+    const items = rows.map(row => ({
+      id: row.id,
+      title: row.title,
+      kind: row.type,
+      when: row.due_ts,
+      receiver_email: row.receiver_email,
+      person_name: row.person_name,
+      phone: row.phone,
+      client_name: row.client_name || null,
+      notes: row.notes || null
+    }));
+
+    // Calendar links for adding multiple reminders at once via a single ICS
+  const api = (process.env.API_ORIGIN || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+    const idsCsv = encodeURIComponent(ids.join(','));
+    const icsUrl = `${api}/api/reminders/ics?ids=${idsCsv}`;
+  // For consistency across clients and to avoid external fetch issues, always provide direct ICS download links
+  const appleUrl = icsUrl;
+  const teamsUrl = icsUrl;
+  const outlookUrl = icsUrl;
+  const googleUrl = icsUrl;
+
+    const html = remindersEmailHtml({ items, calendar: { icsUrl, appleUrl, outlookUrl, teamsUrl, googleUrl } });
+    // Subject: simple, date-based
+    const now = new Date();
+    const today = now.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }).replace(/\./g, '');
+    const subject = `Follow-ups: Today & Tomorrow (${today})`;
+
+    // Suggested recipients: include EMAIL reminders' receiver_email and optionally client emails from linked opportunities
+    const emailsSet = new Set();
+    for (const row of rows) {
+      if (row.type === 'EMAIL' && row.receiver_email) emailsSet.add(String(row.receiver_email).trim());
+    }
+    if (includeClientEmails) {
+      // look up opportunity client email where available
+      for (const row of rows) {
+        const oppId = row.opportunity_id;
+        if (!oppId) continue;
+        try {
+          const profile = await getUnifiedClientProfile(String(oppId), pool, req);
+          const email = profile && profile.details && profile.details.email;
+          if (email) emailsSet.add(String(email).trim());
+        } catch {}
+      }
+    }
+    const suggestedTo = Array.from(emailsSet.values());
+  res.json({ html, subject, suggestedTo, icsUrl, googleUrl });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Send an email (generic) with optional ICS attachment generated from meetingId or meeting payload
 // Body: { to, cc?, bcc?, subject, html, meetingId?, meeting? }
 app.post('/api/email/send', requireAuth, async (req, res) => {
   try {
-    let { to, cc, bcc, subject, html, meetingId, meeting } = req.body || {};
+    let { to, cc, bcc, subject, html, meetingId, meeting, remindersIds } = req.body || {};
     const normList = (v) => {
       if (!v) return [];
       if (Array.isArray(v)) return v.filter(Boolean).map(x => String(x).trim()).filter(Boolean);
@@ -2530,7 +2663,7 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
     if (!toList.length) return res.status(400).json({ error: 'to is required' });
     if (!subject || !html) return res.status(400).json({ error: 'subject and html are required' });
 
-    // Optional ICS attachment
+  // Optional ICS attachment
     const attachments = [];
     if (meetingId || (meeting && meeting.title && meeting.clientName && meeting.startsAt)) {
       let dto;
@@ -2558,6 +2691,27 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
         } catch (e) {
           console.warn('[email/send] ICS generation failed:', e.message);
         }
+      }
+    }
+
+    // Optional multi-ICS for reminders selection
+    const rIds = Array.isArray(remindersIds) ? remindersIds.filter(Boolean).map(String) : [];
+    if (rIds.length) {
+      try {
+        const ph = rIds.map((_, i) => `$${i + 1}`).join(',');
+        const r = await pool.query(
+          `SELECT id, title, type, notes, due_ts AS when, person_name, phone, client_name
+             FROM reminders
+            WHERE id IN (${ph})
+            ORDER BY due_ts ASC NULLS LAST`, rIds);
+        if (r.rows && r.rows.length) {
+          const ics = await generateICSMultiForReminders(r.rows);
+          const today = new Date();
+          const ymd = today.toISOString().slice(0,10).replace(/-/g,'');
+          attachments.push({ filename: `reminders-${ymd}.ics`, content: ics, contentType: 'text/calendar; charset=utf-8' });
+        }
+      } catch (e) {
+        console.warn('[email/send] reminders multi-ICS generation failed:', e.message);
       }
     }
 
