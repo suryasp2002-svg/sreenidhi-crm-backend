@@ -15,11 +15,11 @@ CREATE TABLE IF NOT EXISTS public.drivers (
 );
 
 -- Driver info attached to daily readings (optional text fields)
-ALTER TABLE public.truck_dispenser_day_readings
+ALTER TABLE IF EXISTS public.truck_dispenser_day_readings
     ADD COLUMN IF NOT EXISTS driver_name TEXT NULL,
     ADD COLUMN IF NOT EXISTS driver_code TEXT NULL;
 
-ALTER TABLE public.truck_odometer_day_readings
+ALTER TABLE IF EXISTS public.truck_odometer_day_readings
     ADD COLUMN IF NOT EXISTS driver_name TEXT NULL,
     ADD COLUMN IF NOT EXISTS driver_code TEXT NULL;
 

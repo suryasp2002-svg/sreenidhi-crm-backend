@@ -36,10 +36,7 @@ WHERE load_type <> 'EMPTY_TRANSFER'
     SELECT 1
       FROM public.fuel_internal_transfers fit
       WHERE fit.to_lot_id = fl.id
-        AND (
-          fit.transfer_to_empty = TRUE
-          OR (fit.to_lot_code_after = fl.lot_code_initial AND fit.transfer_volume_liters = fl.loaded_liters)
-        )
+        AND fit.transfer_to_empty = TRUE
   );
 
 -- 2) Enforce immutable created_at on fuel_lots by resetting any attempted change during UPDATE
