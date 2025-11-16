@@ -64,6 +64,20 @@ async function refreshFeatureFlags(db) {
   } catch (e) {
     featureFlags.hasImages = false;
   }
+  // Detect reminders email audit tables to enable aggregates safely without env flags
+  try {
+    const resa = await db.query(`SELECT to_regclass('public.reminder_email_selected_audit') AS reg`);
+    featureFlags.hasRemindersEmailAudit = !!(resa.rows && resa.rows[0] && resa.rows[0].reg);
+  } catch (e) {
+    featureFlags.hasRemindersEmailAudit = false;
+  }
+  // Detect reminder call attempt audit table
+  try {
+    const rca = await db.query(`SELECT to_regclass('public.reminder_call_attempt_audit') AS reg`);
+    featureFlags.hasRemindersCallAudit = !!(rca.rows && rca.rows[0] && rca.rows[0].reg);
+  } catch (e) {
+    featureFlags.hasRemindersCallAudit = false;
+  }
 }
 
 // Ensure combined view for admin/owner employee profiles exists (idempotent)
@@ -128,6 +142,13 @@ async function ensureMinimalSchema(db) {
     await db.query("CREATE INDEX IF NOT EXISTS idx_contracts_created_at ON public.contracts(created_at DESC)");
     await db.query("CREATE INDEX IF NOT EXISTS idx_contracts_client_name ON public.contracts(client_name)");
 
+    // meetings.meeting_link (optional URL for online meeting)
+    try {
+      await db.query("ALTER TABLE public.meetings ADD COLUMN IF NOT EXISTS meeting_link TEXT NULL");
+    } catch (e) {
+      if (!process.env.SUPPRESS_DB_LOG) console.warn('[ensureMinimalSchema] meeting_link warn:', e.message);
+    }
+
     // Minimal users table to unblock auth if migrations haven't run yet
     await db.query(`
       CREATE TABLE IF NOT EXISTS public.users (
@@ -147,6 +168,80 @@ async function ensureMinimalSchema(db) {
     `);
     await db.query("CREATE INDEX IF NOT EXISTS idx_users_role ON public.users(role)");
     await db.query("CREATE INDEX IF NOT EXISTS idx_users_active ON public.users(active)");
+
+    // Trips per truck per day (to support multiple depot trips in a day)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.truck_dispenser_trips (
+        id BIGSERIAL PRIMARY KEY,
+        truck_id INTEGER NOT NULL REFERENCES public.storage_units(id) ON DELETE CASCADE,
+        reading_date DATE NOT NULL,
+        trip_no INTEGER NOT NULL CHECK (trip_no > 0),
+        opening_liters INTEGER NOT NULL DEFAULT 0 CHECK (opening_liters >= 0),
+        closing_liters INTEGER NOT NULL DEFAULT 0 CHECK (closing_liters >= 0),
+        opening_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        closing_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        note TEXT,
+        driver_name TEXT,
+        driver_code TEXT,
+        created_by TEXT,
+        created_by_user_id UUID,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_trips_per_day UNIQUE (truck_id, reading_date, trip_no)
+      )`);
+    await db.query("CREATE INDEX IF NOT EXISTS idx_trips_truck_date ON public.truck_dispenser_trips(truck_id, reading_date, trip_no)");
+    // Create new dispenser day reading logs table (lightweight audit of opening/closing readings)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.dispenser_day_reading_logs (
+        id BIGSERIAL PRIMARY KEY,
+        truck_id INTEGER NOT NULL REFERENCES public.storage_units(id) ON DELETE CASCADE,
+        truck_code TEXT NULL,
+        reading_date DATE NOT NULL,
+        opening_liters INTEGER NOT NULL DEFAULT 0 CHECK (opening_liters >= 0),
+        opening_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        closing_liters INTEGER NULL,
+        closing_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        note TEXT,
+        driver_name TEXT,
+        driver_code TEXT,
+        created_by TEXT,
+        created_by_user_id UUID,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_dispenser_day_unique UNIQUE (truck_id, reading_date)
+      )
+    `);
+    await db.query("CREATE INDEX IF NOT EXISTS idx_dispenser_day_truck_date ON public.dispenser_day_reading_logs(truck_id, reading_date)");
+    // Ensure truck_code column exists for older DBs and populate from storage_units when possible
+    try {
+      await db.query("ALTER TABLE public.dispenser_day_reading_logs ADD COLUMN IF NOT EXISTS truck_code TEXT NULL");
+      await db.query("CREATE INDEX IF NOT EXISTS idx_dispenser_day_truck_code ON public.dispenser_day_reading_logs(truck_code)");
+      // Backfill existing rows where truck_code is NULL
+      await db.query("UPDATE public.dispenser_day_reading_logs SET truck_code = (SELECT unit_code FROM public.storage_units su WHERE su.id = public.dispenser_day_reading_logs.truck_id) WHERE truck_code IS NULL");
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[ensureMinimalSchema dispenser_day truck_code warn]', e.message); }
+    // Create testing_self_transfers table to record same-tanker testing events separately
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.testing_self_transfers (
+        id BIGSERIAL PRIMARY KEY,
+        lot_id BIGINT NULL REFERENCES public.fuel_lots(id) ON DELETE CASCADE,
+        activity TEXT NOT NULL,
+        from_unit_id INTEGER NULL REFERENCES public.storage_units(id) ON DELETE RESTRICT,
+        from_unit_code TEXT NULL,
+        to_vehicle TEXT NULL,
+        transfer_volume_liters INTEGER NOT NULL,
+        lot_code TEXT NULL,
+        driver_id INTEGER NULL REFERENCES public.drivers(id) ON DELETE SET NULL,
+        driver_name TEXT NULL,
+        performed_by TEXT NULL,
+        performed_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_by TEXT NULL,
+        sale_date DATE NULL,
+        trip INTEGER NULL,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.query("CREATE INDEX IF NOT EXISTS idx_testing_self_from_unit ON public.testing_self_transfers(from_unit_id)");
   } catch (e) {
     console.warn('[ensureMinimalSchema] warning:', e.message);
   }
@@ -333,6 +428,2917 @@ app.post('/api/diagnostics/refresh-features', async (req, res) => {
   }
 });
 
+// ----------------------- Fuel Ops APIs -----------------------
+// List storage units (optionally by type), requires auth
+app.get('/api/fuel-ops/storage-units', requireAuth, async (req, res) => {
+  try {
+    const type = (req.query.type || '').toString().toUpperCase();
+    const onlyActive = String(req.query.active || 'true').toLowerCase() !== 'false';
+    const params = [];
+  let sql = `SELECT id, unit_type, unit_code, capacity_liters, active
+               FROM public.storage_units`;
+    const where = [];
+    if (type && ['TRUCK','DATUM','DISPENSER'].includes(type)) {
+      params.push(type);
+      where.push(`unit_type = $${params.length}`);
+    }
+    if (onlyActive) {
+      where.push('active = TRUE');
+    }
+    if (where.length) {
+      sql += ' WHERE ' + where.join(' AND ');
+    }
+    sql += ' ORDER BY unit_type, unit_code';
+    const r = await pool.query(sql, params);
+    res.json(r.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Update a storage unit (vehicle/datum/dispenser) - OWNER/ADMIN
+app.put('/api/fuel-ops/storage-units/:id', requireAuth, requireRole('OWNER','ADMIN'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const cur = await pool.query(`SELECT * FROM public.storage_units WHERE id=$1`, [id]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Not found' });
+  const { unit_code, capacity_liters, vehicle_number, active } = req.body || {};
+    const code = unit_code !== undefined ? String(unit_code || '').trim() : cur.rows[0].unit_code;
+    const cap = capacity_liters !== undefined ? parseInt(capacity_liters,10) : cur.rows[0].capacity_liters;
+    const veh = vehicle_number !== undefined ? (vehicle_number || null) : cur.rows[0].vehicle_number;
+  const act = active !== undefined ? !!active : cur.rows[0].active;
+    if (!code) return res.status(400).json({ error: 'unit_code required' });
+    if (!Number.isFinite(cap) || cap <= 0) return res.status(400).json({ error: 'capacity_liters must be > 0' });
+    // enforce unit_code uniqueness when changed
+    if (code !== cur.rows[0].unit_code) {
+      const exists = await pool.query(`SELECT 1 FROM public.storage_units WHERE unit_code=$1 AND id<>$2`, [code, id]);
+      if (exists.rowCount) return res.status(409).json({ error: 'unit_code already exists' });
+    }
+    const r = await pool.query(`
+      UPDATE public.storage_units
+         SET unit_code=$1, capacity_liters=$2, vehicle_number=$3, active=$4, updated_at=NOW()
+       WHERE id=$5
+       RETURNING id, unit_type, unit_code, capacity_liters, active, vehicle_number
+    `, [code, cap, veh, act, id]);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Shortcut to list dispensers only
+app.get('/api/fuel-ops/dispensers', requireAuth, async (req, res) => {
+  try {
+  const r = await pool.query(`SELECT id, unit_type, unit_code, capacity_liters, active
+                                FROM public.storage_units
+                                WHERE unit_type='DISPENSER' AND active=TRUE
+                                ORDER BY unit_code`);
+    res.json(r.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Drivers CRUD-lite
+app.get('/api/fuel-ops/drivers', requireAuth, async (req, res) => {
+  try {
+    const onlyActive = String(req.query.active || 'true').toLowerCase() !== 'false';
+    const r = await pool.query(`SELECT id, name, phone, driver_id, active FROM public.drivers ${onlyActive ? 'WHERE active=TRUE' : ''} ORDER BY name`);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/fuel-ops/drivers', requireAuth, requireRole('OWNER','ADMIN'), async (req, res) => {
+  try {
+    const { name, phone, driver_id, active } = req.body || {};
+    const nm = String(name || '').trim();
+    const code = String(driver_id || '').trim().toUpperCase();
+    if (!nm) return res.status(400).json({ error: 'name required' });
+    if (!code) return res.status(400).json({ error: 'driver_id required' });
+    const r = await pool.query(`
+      INSERT INTO public.drivers (name, phone, driver_id, active)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (driver_id) DO NOTHING
+      RETURNING id, name, phone, driver_id, active
+    `, [nm, phone || null, code, active === false ? false : true]);
+    if (!r.rows.length) return res.status(409).json({ error: 'driver_id already exists' });
+    res.status(201).json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/fuel-ops/drivers/:id', requireAuth, requireRole('OWNER','ADMIN'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const cur = await pool.query(`SELECT * FROM public.drivers WHERE id=$1`, [id]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Not found' });
+    const { name, phone, driver_id, active } = req.body || {};
+    const nm = name !== undefined ? String(name || '').trim() : cur.rows[0].name;
+    const code = driver_id !== undefined ? String(driver_id || '').trim().toUpperCase() : cur.rows[0].driver_id;
+    const ph = phone !== undefined ? (phone || null) : cur.rows[0].phone;
+    const act = active !== undefined ? !!active : cur.rows[0].active;
+    if (!nm) return res.status(400).json({ error: 'name required' });
+    if (!code) return res.status(400).json({ error: 'driver_id required' });
+    if (code !== cur.rows[0].driver_id) {
+      const d = await pool.query(`SELECT 1 FROM public.drivers WHERE driver_id=$1 AND id<>$2`, [code, id]);
+      if (d.rowCount) return res.status(409).json({ error: 'driver_id already exists' });
+    }
+    const r = await pool.query(`
+      UPDATE public.drivers
+         SET name=$1, phone=$2, driver_id=$3, active=$4, updated_at=NOW()
+       WHERE id=$5
+       RETURNING id, name, phone, driver_id, active
+    `, [nm, ph, code, act, id]);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Preview next lot code for a unit and date (no insert)
+app.get('/api/fuel-ops/lot-code', requireAuth, async (req, res) => {
+  try {
+    const unitId = parseInt(req.query.unit_id, 10);
+    const loadDate = req.query.load_date ? new Date(String(req.query.load_date)) : new Date();
+    const liters = parseInt(req.query.loaded_liters, 10) || 0;
+    if (!Number.isFinite(unitId) || unitId <= 0) return res.status(400).json({ error: 'unit_id required' });
+    if (!(loadDate instanceof Date) || isNaN(loadDate.getTime())) return res.status(400).json({ error: 'load_date invalid' });
+    if (!Number.isFinite(liters) || liters <= 0) return res.status(400).json({ error: 'loaded_liters must be > 0' });
+    const dstr = `${loadDate.getFullYear()}-${String(loadDate.getMonth()+1).padStart(2,'0')}-${String(loadDate.getDate()).padStart(2,'0')}`;
+    const r = await pool.query(`SELECT * FROM public.preview_next_lot_code($1::int, $2::date, $3::int)`, [unitId, dstr, liters]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ lot_code: r.rows[0].lot_code, seq_index: r.rows[0].seq_index });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create a fuel lot (inserts a row, returns lot)
+app.post('/api/fuel-ops/lots', requireAuth, async (req, res) => {
+  const actor = getActor(req);
+  try {
+  const { unit_id, load_date, loaded_liters, performed_time, load_time, tanker_code } = req.body || {};
+    const unitId = parseInt(unit_id, 10);
+    const liters = parseInt(loaded_liters, 10);
+    if (!Number.isFinite(unitId) || unitId <= 0) return res.status(400).json({ error: 'unit_id required' });
+    if (!Number.isFinite(liters) || liters <= 0) return res.status(400).json({ error: 'loaded_liters must be > 0' });
+    let d = load_date ? new Date(String(load_date)) : new Date();
+    if (!(d instanceof Date) || isNaN(d.getTime())) return res.status(400).json({ error: 'load_date invalid' });
+    const dstr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    // Validate capacity before insert
+    const su = await pool.query(`SELECT id, unit_code, capacity_liters FROM public.storage_units WHERE id=$1`, [unitId]);
+    if (!su.rows.length) return res.status(400).json({ error: 'Unknown storage unit' });
+    if (liters > su.rows[0].capacity_liters) return res.status(400).json({ error: `loaded_liters cannot exceed capacity ${su.rows[0].capacity_liters}` });
+    // Use SQL function with advisory lock to create row safely
+    const r = await pool.query(`SELECT * FROM public.create_fuel_lot($1::int, $2::date, $3::int)`, [unitId, dstr, liters]);
+    const row = r.rows && r.rows[0];
+    // If caller provided an external tanker identifier, persist it on the created lot
+    try {
+      if (tanker_code && row && row.id) {
+        await pool.query(`UPDATE public.fuel_lots SET tanker_code = $1 WHERE id=$2`, [String(tanker_code).trim(), row.id]);
+      }
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[warn] set tanker_code failed', e.message); }
+    // Store original load time separately (do not alter created_at)
+    try {
+      let finalLoadTs = null;
+      const hhmm = (load_time || performed_time || '').trim();
+      if (/^\d{2}:\d{2}$/.test(hhmm)) {
+        finalLoadTs = `${dstr} ${hhmm}:00`;
+      } else if (load_time && /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(load_time)) {
+        // Full timestamp string already
+        finalLoadTs = load_time.length === 16 ? load_time+':00' : load_time;
+      }
+      if (finalLoadTs) {
+        await pool.query(`UPDATE public.fuel_lots SET load_time = $1::timestamp WHERE id=$2`, [finalLoadTs, row.id]);
+      }
+    } catch {}
+    // Persist actor on the created lot (best-effort)
+    try {
+      await pool.query(`UPDATE public.fuel_lots SET created_by=$1 WHERE id=$2`, [actor, row.id]);
+    } catch {}
+    // Reload with load_time field if set. Use runtime-resolved date column and expose as load_date
+    let full = row;
+    try {
+      const dateCol = await resolveFuelLotsDateCol();
+      const q2 = await pool.query(`SELECT id, unit_id, tanker_code, ${dateCol} AS load_date, tanker_capacity, loaded_liters, seq_index, seq_letters, lot_code_created, created_at, load_time, load_time_hhmm FROM public.fuel_lots WHERE id=$1`, [row.id]);
+      if (q2.rows.length) full = q2.rows[0];
+    } catch {}
+    res.status(201).json({
+      id: full.id,
+      unit_id: full.unit_id,
+      tanker_code: full.tanker_code,
+      load_date: full.load_date,
+      tanker_capacity: full.tanker_capacity,
+      loaded_liters: full.loaded_liters,
+      seq_index: full.seq_index,
+      seq_letters: full.seq_letters,
+      lot_code: full.lot_code_created,
+      created_at: full.created_at,
+      load_time: full.load_time || null,
+      created_by: actor
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Record a lot activity (transfer/sale) and update lot counters
+// Record a lot activity (transfer/sale/testing) and update lot counters
+app.post('/api/fuel-ops/lots/activity', requireAuth, async (req, res) => {
+  const actor = getActor(req);
+  try {
+    const { activity, from_unit_id, to_unit_id, to_vehicle, volume_liters, driver_id, transfer_to_empty, transfer_date, sale_date, performed_time, trip } = req.body || {};
+    const act = String(activity || '').toUpperCase();
+    // Allow TESTING (net-zero meter usage that should not decrement remaining lot liters)
+    const allowed = new Set(['TANKER_TO_TANKER','TANKER_TO_DATUM','TANKER_TO_VEHICLE','DATUM_TO_VEHICLE','TESTING']);
+    if (!allowed.has(act)) return res.status(400).json({ error: 'invalid activity' });
+    const fromId = parseInt(from_unit_id, 10);
+    if (!Number.isFinite(fromId) || fromId <= 0) return res.status(400).json({ error: 'from_unit_id required' });
+    const toId = to_unit_id != null ? parseInt(to_unit_id, 10) : null;
+    const vol = parseInt(volume_liters, 10);
+    if (!Number.isFinite(vol) || vol <= 0) return res.status(400).json({ error: 'volume_liters must be > 0' });
+
+    // Resolve driver (optional)
+    let drow = null;
+    if (driver_id != null) {
+      const dr = await pool.query(`SELECT id, name, driver_id FROM public.drivers WHERE id=$1`, [parseInt(driver_id,10)]);
+      drow = dr.rows[0] || null;
+    }
+
+    // Helper to compute cumulative inbound added liters for a lot
+    async function getInboundAddedLiters(lotId) {
+      // Exclude seeding transfers explicitly: flagged transfer_to_empty OR where to_lot_code_after equals the initial lot code and volume equals lot.loaded_liters
+      const q = await pool.query(
+        `SELECT COALESCE(SUM(fit.transfer_volume),0) AS added
+           FROM public.fuel_internal_transfers fit
+           JOIN public.fuel_lots fl ON fl.id = fit.to_lot_id
+          WHERE fit.to_lot_id=$1
+            AND NOT (
+              fit.transfer_to_empty = TRUE
+              OR (fit.to_lot_code_change = fl.lot_code_created AND fit.transfer_volume = fl.loaded_liters)
+            )`,
+        [lotId]
+      );
+      return Number(q.rows[0]?.added || 0);
+    }
+    // Helper to compute cumulative USED liters for a lot from all outbound ops (sales + internal transfers)
+    async function getOutboundUsedLiters(lotId) {
+      const sales = await pool.query(`SELECT COALESCE(SUM(sale_volume_liters),0) AS s FROM public.fuel_sale_transfers WHERE lot_id=$1`, [lotId]);
+  const xfers = await pool.query(`SELECT COALESCE(SUM(transfer_volume),0) AS t FROM public.fuel_internal_transfers WHERE from_lot_id=$1`, [lotId]);
+      return Number(sales.rows[0]?.s || 0) + Number(xfers.rows[0]?.t || 0);
+    }
+
+    // Find latest in-stock lot for source unit
+    const lotQ = await pool.query(`
+      SELECT * FROM public.fuel_lots
+       WHERE unit_id=$1 AND stock_status='INSTOCK'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1
+    `, [fromId]);
+    if (!lotQ.rows.length) return res.status(400).json({ error: 'No in-stock lot found for source unit' });
+    const lot = lotQ.rows[0];
+    const lotId = lot.id;
+    // Compute authoritative current state from logs: remaining = loaded + inboundAdds - outboundUsed
+    const addedIn = await getInboundAddedLiters(lot.id);
+    const usedOutBefore = await getOutboundUsedLiters(lot.id);
+    const remaining = Math.max(0, Number(lot.loaded_liters) + addedIn - usedOutBefore);
+    // For internal transfers, we validate against aggregate remaining across all lots later (FIFO split),
+    // so do not block here on single-lot remaining.
+    if (vol > remaining && !(act === 'TANKER_TO_TANKER' || act === 'TANKER_TO_DATUM')) {
+      return res.status(400).json({ error: `insufficient volume in lot; remaining ${remaining}` });
+    }
+
+    // Fetch unit codes and metadata for from/to
+    const fromUnit = await pool.query(`SELECT id, unit_code FROM public.storage_units WHERE id=$1`, [fromId]);
+    if (!fromUnit.rows.length) return res.status(400).json({ error: 'Invalid from_unit_id' });
+    let toUnit = { rows: [] };
+    if (toId) toUnit = await pool.query(`SELECT id, unit_code, unit_type, capacity_liters FROM public.storage_units WHERE id=$1`, [toId]);
+
+    // --- TESTING activity (net-zero; only logs testing volume and increments cumulative_testing_liters) ---
+    if (act === 'TESTING') {
+      // Optional performed_at timestamp logic (use transfer_date/sale_date semantics consistent with other branches)
+      const dateOnly = transfer_date ? isoDateOnly(transfer_date) : (sale_date ? isoDateOnly(sale_date) : isoDateOnly(new Date()));
+      let tsSql = null;
+      const hhmm = (performed_time || '').trim();
+      if (dateOnly && /^\d{2}:\d{2}$/.test(hhmm)) {
+        tsSql = `${dateOnly} ${hhmm}:00`;
+      } else if (dateOnly) {
+        tsSql = `${dateOnly} 00:00:00`;
+      }
+      // Historically we recorded TESTING activities in `fuel_lot_activities`.
+      // That table has been deprecated/removed; rely on `testing_self_transfers` and
+      // `fuel_lots.cumulative_testing_liters` for audit and aggregates instead.
+      let actRow = null;
+      // Increment cumulative_testing_liters (best-effort). Do NOT change used_liters or stock_status.
+      let updLot = null;
+      try {
+        const upd = await pool.query(`
+          UPDATE public.fuel_lots
+             SET cumulative_testing_liters = COALESCE(cumulative_testing_liters,0) + $2,
+                 updated_at = NOW()
+           WHERE id=$1
+           RETURNING *
+        `, [lot.id, vol]);
+        updLot = upd.rows[0];
+      } catch (e) {
+        if (!process.env.SUPPRESS_DB_LOG) console.warn('[TESTING lot update warn]', e.message);
+        // Return original lot if update failed
+        updLot = lot;
+      }
+      // Also insert a record into internal transfers for audit/visibility.
+      // Note: activity='TESTING' entries are excluded from stock aggregates (see helpers above),
+      // so this will not affect used_liters or stock_status.
+      try {
+        const fromUnitCode = fromUnit.rows[0].unit_code;
+        const performedAtSql = (tsSql || null);
+        const tripVal = (Number.isFinite(parseInt(trip,10)) && parseInt(trip,10) > 0) ? parseInt(trip,10) : null;
+        const ins = await pool.query(`
+          INSERT INTO public.testing_self_transfers (
+            lot_id, activity, from_unit_id, from_unit_code, to_vehicle,
+            transfer_volume_liters, lot_code, driver_id, driver_name, performed_by,
+            performed_at, updated_by, sale_date, trip
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, COALESCE($11::timestamp, NOW()), $12, COALESCE($13::date, NULL), $14)
+          RETURNING *
+        `, [
+          lot.id, act, fromId, fromUnitCode, fromUnitCode,
+          vol, lot.lot_code_created || null, drow ? drow.id : null, drow ? drow.name : null, actor,
+          performedAtSql, actor, dateOnly, tripVal
+        ]);
+        if (!process.env.SUPPRESS_DB_LOG) console.info('[TESTING self transfer inserted]', ins.rows[0]);
+      } catch (e) {
+        if (!process.env.SUPPRESS_DB_LOG) console.warn('[TESTING self insert warn]', e.message);
+      }
+      return res.status(201).json({ testing: actRow, lot: updLot });
+    }
+
+    // Branch to new tables
+    const isInternal = act === 'TANKER_TO_TANKER' || act === 'TANKER_TO_DATUM';
+    if (isInternal) {
+      if (!toId) return res.status(400).json({ error: 'to_unit_id required for internal transfer' });
+      // Enforce: Opening reading must be recorded for the source tanker on the transfer date; closing is NOT required here
+      try {
+        const dateOnly = transfer_date ? isoDateOnly(transfer_date) : isoDateOnly(new Date());
+        // First check day dispenser readings
+        const openQ = await pool.query(
+          `SELECT opening_liters FROM public.dispenser_day_reading_logs WHERE truck_id=$1 AND reading_date=$2`,
+          [fromId, dateOnly]
+        );
+        let hasOpening = false;
+        if (openQ.rows.length && openQ.rows[0].opening_liters != null) {
+          hasOpening = true;
+        } else {
+          // Fallback: accept trip opening (opening_liters or opening_at) created under trips for the same date
+          try {
+            const tripQ = await pool.query(
+              `SELECT opening_at, opening_liters FROM public.truck_dispenser_trips WHERE truck_id=$1 AND reading_date=$2 AND (opening_at IS NOT NULL OR opening_liters IS NOT NULL) LIMIT 1`,
+              [fromId, dateOnly]
+            );
+            if (tripQ.rows.length) hasOpening = true;
+          } catch (e) {
+            // ignore trip lookup errors
+          }
+        }
+        if (!hasOpening) {
+          return res.status(400).json({ error: 'Opening reading missing for this tanker on the selected date. Please record opening before transfers.' });
+        }
+      } catch (e) { /* if table missing, skip enforcement */ }
+      // Find latest in-stock lot for destination unit
+      let lotToQ = await pool.query(`
+        SELECT * FROM public.fuel_lots
+         WHERE unit_id=$1 AND stock_status='INSTOCK'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+      `, [toId]);
+      // If destination is a DATUM and has no lot yet, auto-create a lot seeded with this transfer's volume
+      let createdNewDestLot = false;
+      if (!lotToQ.rows.length) {
+        const tRow = toUnit.rows[0];
+        // Allow seeding for empty destination DATUM or TRUCK (tanker) using transfer volume as initial loaded_liters
+        if (tRow && (tRow.unit_type === 'DATUM' || tRow.unit_type === 'TRUCK')) {
+          const toUnitCap = tRow.capacity_liters;
+          if (vol > toUnitCap) {
+            return res.status(400).json({ error: `destination capacity exceeded: would be ${vol}/${toUnitCap}` });
+          }
+          // Create a new lot on the destination unit seeded with this transfer volume
+          try {
+            // Use the same load date as the transfer (or today if not provided)
+            const createDate = transfer_date ? isoDateOnly(transfer_date) : isoDateOnly(new Date());
+            const created = await pool.query(`SELECT * FROM public.create_fuel_lot($1::int, $2::date, $3::int)`, [toId, createDate, vol]);
+            if (created.rows && created.rows[0]) {
+              lotToQ = { rows: [created.rows[0]] };
+              createdNewDestLot = true;
+            }
+          } catch (e) {
+            if (!process.env.SUPPRESS_DB_LOG) console.warn('[WARN] failed to create destination lot for empty unit', e.message);
+          }
+        }
+      }
+      // If we created a destination lot by seeding from this transfer, mark its load_type as EMPTY_TRANSFER
+      try {
+        if (createdNewDestLot && lotToQ.rows[0] && lotToQ.rows[0].id) {
+          await pool.query(`UPDATE public.fuel_lots SET load_type = 'EMPTY_TRANSFER' WHERE id = $1`, [lotToQ.rows[0].id]);
+          // refresh lotTo with updated row
+          const ref = await pool.query(`SELECT * FROM public.fuel_lots WHERE id = $1`, [lotToQ.rows[0].id]);
+          if (ref.rows && ref.rows[0]) lotToQ.rows[0] = ref.rows[0];
+        }
+      } catch (e) {
+        if (!process.env.SUPPRESS_DB_LOG) console.warn('[WARN] failed to mark created lot load_type EMPTY_TRANSFER', e.message);
+      }
+      // Ensure lotTo reference exists for later code
+      const lotTo = (lotToQ.rows && lotToQ.rows[0]) ? lotToQ.rows[0] : null;
+      if (!lotTo) return res.status(400).json({ error: 'No in-stock lot found for destination unit' });
+      const sales = await pool.query(`SELECT COALESCE(SUM(sale_volume_liters),0) AS s FROM public.fuel_sale_transfers WHERE lot_id=$1`, [lotId]);
+      const xfers = await pool.query(`SELECT COALESCE(SUM(transfer_volume),0) AS t FROM public.fuel_internal_transfers WHERE from_lot_id=$1 AND COALESCE(activity,'') <> 'TESTING'`, [lotId]);
+      // Unit codes
+      const fromUnitCode = fromUnit.rows[0].unit_code;
+      const toUnitCode = (toUnit.rows[0] || {}).unit_code;
+
+      // Collect all in-stock source lots (FIFO by creation)
+      const sourceLotsQ = await pool.query(`
+        SELECT * FROM public.fuel_lots
+         WHERE unit_id=$1 AND stock_status='INSTOCK'
+         ORDER BY created_at ASC, id ASC
+      `, [fromId]);
+      if (!sourceLotsQ.rows.length) return res.status(400).json({ error: 'No in-stock lot found for source unit' });
+      // Compute aggregate remaining across all source lots
+      const lotRemaining = [];
+      let totalRemaining = 0;
+      for (const L of sourceLotsQ.rows) {
+        const added = await getInboundAddedLiters(L.id);
+        const used = await getOutboundUsedLiters(L.id);
+        const rem = Math.max(0, Number(L.loaded_liters) + added - used);
+        lotRemaining.push({ lot: L, inbound: added, usedOut: used, remaining: rem });
+        totalRemaining += rem;
+      }
+      if (vol > totalRemaining) {
+        return res.status(400).json({ error: `insufficient volume in lot; remaining ${totalRemaining}` });
+      }
+
+      // Capacity guard: destination net after transfer must be <= capacity
+      const toAddedBefore = createdNewDestLot ? 0 : await getInboundAddedLiters(lotTo.id);
+      const toUsedOutBefore = createdNewDestLot ? 0 : await getOutboundUsedLiters(lotTo.id);
+      const destCap = Number((toUnit.rows[0] || {}).capacity_liters || 0);
+      if (destCap > 0) {
+        const toCurrentNet = (createdNewDestLot ? 0 : (Number(lotTo.loaded_liters) + toAddedBefore - toUsedOutBefore));
+        const toNetAfter = toCurrentNet + vol;
+        if (toNetAfter > destCap) {
+          return res.status(400).json({ error: `destination capacity exceeded: would be ${toNetAfter}/${destCap}` });
+        }
+      }
+
+      // Determine timestamp/date for the transfer (allow HH:mm override)
+      const dateOnly = transfer_date ? isoDateOnly(transfer_date) : null;
+      let tsSql = null;
+      const hhmm = (performed_time || '').trim();
+      if (dateOnly && /^\d{2}:\d{2}$/.test(hhmm)) tsSql = `${dateOnly} ${hhmm}:00`;
+
+      // Ensure destination lot load_time set when we created it via EMPTY_TRANSFER
+      try { if (createdNewDestLot && tsSql) await pool.query(`UPDATE public.fuel_lots SET load_time=$1::timestamp WHERE id=$2`, [tsSql, lotTo.id]); } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[warn] set load_time for EMPTY_TRANSFER lot failed', e.message); }
+
+      // Running dispenser adjust based on previous max
+      const prevAdjQ = await pool.query(`
+        SELECT COALESCE(MAX(dispenser_reading_transfer_adjust), 0)::int AS prev
+          FROM public.fuel_internal_transfers
+         WHERE from_unit_id = $1
+      `, [fromId]);
+      let runningAdjust = prevAdjQ.rows[0] ? Number(prevAdjQ.rows[0].prev) : 0;
+
+      const xferRows = [];
+      let remainingToTransfer = vol;
+      for (const entry of lotRemaining) {
+        if (remainingToTransfer <= 0) break;
+        const take = Math.min(entry.remaining, remainingToTransfer);
+        if (take <= 0) continue;
+
+        // Compose from/to lot codes for this chunk
+        const fromUsedNow = await getOutboundUsedLiters(entry.lot.id);
+        const fromUsedAfter = fromUsedNow + take;
+        const fromSuffix = `-${fromUsedAfter}` + (entry.inbound > 0 ? `+(${entry.inbound})` : '');
+        const fromLotCodeAfter = `${entry.lot.lot_code_created}${fromSuffix}`;
+
+        const toAddedAfter = createdNewDestLot ? 0 : (toAddedBefore + xferRows.reduce((a,r)=>a+r.transfer_volume,0) + take);
+        const toSuffix = createdNewDestLot ? '' : (`-${Number(lotTo.used_liters || 0)}` + (toAddedAfter > 0 ? `+(${toAddedAfter})` : ''));
+        const toLotCodeAfter = `${lotTo.lot_code_created}${toSuffix}`;
+
+        runningAdjust += take;
+        const ins = await pool.query(`
+          INSERT INTO public.fuel_internal_transfers (
+            from_lot_id, to_lot_id, activity,
+            from_unit_id, from_unit_code, to_unit_id, to_unit_code,
+            transfer_volume, from_tanker_change, from_lot_code_change, to_tanker_change, to_lot_code_change,
+            transfer_to_empty, driver_name, performed_by,
+            dispenser_reading_transfer_adjust, transfer_date, transfer_time
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16, COALESCE($17::date, CURRENT_DATE), $18::time)
+          RETURNING *
+        `, [
+          entry.lot.id, lotTo.id, act,
+          fromId, fromUnitCode, toId, toUnitCode,
+          take, -take, fromLotCodeAfter, take, toLotCodeAfter,
+          (createdNewDestLot ? true : !!transfer_to_empty), drow ? drow.name : null, actor,
+          runningAdjust, dateOnly, (hhmm && /^\d{2}:\d{2}$/.test(hhmm) ? hhmm : '00:00')
+        ]);
+        xferRows.push(ins.rows[0]);
+
+        // Update source lot used and status
+        const fromNetRemaining = (Number(entry.lot.loaded_liters) + entry.inbound) - fromUsedAfter;
+        const fromStock = fromNetRemaining <= 0 ? 'SOLD' : 'INSTOCK';
+        await pool.query(`UPDATE public.fuel_lots SET used_liters=$1, stock_status=$2, updated_at=NOW() WHERE id=$3`, [fromUsedAfter, fromStock, entry.lot.id]);
+        remainingToTransfer -= take;
+      }
+
+      // Update destination stock status (based on inbound adds)
+      const toAddedAfterAll = createdNewDestLot ? vol : (toAddedBefore + xferRows.reduce((a,r)=>a + Number(r.transfer_volume||0), 0));
+      const toNetRemaining = (Number(lotTo.loaded_liters) + (createdNewDestLot ? 0 : toAddedAfterAll)) - Number(lotTo.used_liters || 0);
+      const toStock = toNetRemaining <= 0 ? 'SOLD' : 'INSTOCK';
+      await pool.query(`UPDATE public.fuel_lots SET stock_status=$1, updated_at=NOW() WHERE id=$2`, [toStock, lotTo.id]);
+
+      // Ensure load_type is set to EMPTY_TRANSFER for lots we seeded from an empty destination.
+      try {
+        if (createdNewDestLot && lotTo.id) {
+          await pool.query(`UPDATE public.fuel_lots SET load_type = 'EMPTY_TRANSFER', updated_at=NOW() WHERE id = $1`, [lotTo.id]);
+        }
+      } catch (e) {
+        if (!process.env.SUPPRESS_DB_LOG) console.warn('[WARN] failed to persist EMPTY_TRANSFER load_type on lot', e.message);
+      }
+
+      // Basic lot summary for backwards compatibility (last consumed lot)
+      const last = lotRemaining.find(l => l.remaining > 0 && l.remaining >= 0) ? lotRemaining.filter(l=>l.remaining>0).slice(-1)[0] : lotRemaining[lotRemaining.length-1];
+      const lastUsedNow = await getOutboundUsedLiters(last.lot.id);
+      const lastSuffix = `-${lastUsedNow}` + (last.inbound>0?`+(${last.inbound})`:'');
+      const lotSummary = { lot_code_initial: last.lot.lot_code_created, used_liters: lastUsedNow, loaded_liters: last.lot.loaded_liters, lot_code_by_transfer: `${last.lot.lot_code_created}${lastSuffix}` };
+      return res.status(201).json({ transfers: xferRows, lot: lotSummary, total_transferred: xferRows.reduce((a,r)=>a+Number(r.transfer_volume||0),0) });
+    } else {
+      // Sale transfer to vehicle
+      if (!to_vehicle) return res.status(400).json({ error: 'to_vehicle required' });
+
+    const fromUnitCode = fromUnit.rows[0].unit_code;
+    const inboundAdded = await getInboundAddedLiters(lot.id);
+
+    const usedAfter = Number(lot.used_liters || 0) + vol;
+    const suffix = `-${usedAfter}`;
+  const lotCodeAfter = `${lot.lot_code_created}${suffix}`;
+
+      const baseSaleDate = sale_date ? isoDateOnly(sale_date) : null;
+      // For performed_at: only set when HH:mm is provided; else allow NOW() so records fall within the active trip window
+      let saleDateOnly = null;
+      const hhmmSale = (performed_time || '').trim();
+      if (baseSaleDate && /^\d{2}:\d{2}$/.test(hhmmSale)) {
+        saleDateOnly = `${baseSaleDate} ${hhmmSale}:00`;
+      }
+      const sale = await pool.query(`
+        INSERT INTO public.fuel_sale_transfers (
+          lot_id, from_unit_id, from_unit_code, to_vehicle, sale_volume_liters, lot_code_after,
+          driver_id, driver_name, performed_by, activity,
+          performed_at, sale_date, trip
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, COALESCE($11::timestamp, NOW()), COALESCE($12::date, CURRENT_DATE), $13)
+        RETURNING *
+      `, [
+        lot.id, fromId, fromUnitCode, to_vehicle, vol, lotCodeAfter,
+        drow ? drow.id : null, drow ? drow.name : null, actor, act,
+        saleDateOnly, sale_date ? isoDateOnly(sale_date) : null, (Number.isFinite(parseInt(trip,10)) && parseInt(trip,10) > 0) ? parseInt(trip,10) : null
+      ]);
+
+      const netRemaining = (Number(lot.loaded_liters) + inboundAdded) - usedAfter;
+      const stock = netRemaining <= 0 ? 'SOLD' : 'INSTOCK';
+      const upd = await pool.query(`UPDATE public.fuel_lots SET used_liters=$1, stock_status=$2, updated_at=NOW() WHERE id=$3 RETURNING *`, [usedAfter, stock, lot.id]);
+
+      return res.status(201).json({ sale: sale.rows[0], lot: upd.rows[0] });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Mini stock summary for active TRUCK and DATUM units
+// Returns per-unit capacity and current in-stock liters aggregated across ALL in-stock lots for that unit
+app.get('/api/fuel-ops/stock/summary', requireAuth, async (req, res) => {
+  try {
+    const rows = await pool.query(`
+      WITH units AS (
+        SELECT id, unit_code, unit_type, capacity_liters, vehicle_number
+          FROM public.storage_units
+         WHERE active=TRUE AND unit_type IN ('TRUCK','DATUM')
+      ),
+      lots AS (
+        SELECT id AS lot_id, unit_id, loaded_liters, lot_code_created, created_at
+          FROM public.fuel_lots
+         WHERE stock_status='INSTOCK'
+      ),
+      latest AS (
+        SELECT DISTINCT ON (unit_id) lot_id, unit_id, lot_code_created, created_at
+          FROM lots
+         ORDER BY unit_id, created_at DESC, lot_id DESC
+      ),
+      snaps AS (
+        SELECT truck_id AS unit_id, reading_at, reading_liters,
+               ROW_NUMBER() OVER (PARTITION BY truck_id ORDER BY reading_at DESC) AS rn
+          FROM public.truck_dispenser_meter_snapshots
+      ),
+      inbound AS (
+        SELECT fit.to_lot_id AS lot_id,
+               COALESCE(SUM(fit.transfer_volume) FILTER (
+                 WHERE NOT (
+                   fit.transfer_to_empty = TRUE
+                   OR (fit.to_lot_code_change = fl.lot_code_created AND fit.transfer_volume = fl.loaded_liters)
+                   OR (COALESCE(fit.activity,'') = 'TESTING')
+                 )
+               ),0)::int AS inbound_added
+          FROM public.fuel_internal_transfers fit
+          JOIN public.fuel_lots fl ON fl.id = fit.to_lot_id
+         GROUP BY fit.to_lot_id
+      ),
+      -- Aggregate outbound since latest snapshot (or all-time if no snapshot) at unit level
+      sale_unit AS (
+        SELECT fst.from_unit_id AS unit_id,
+               COALESCE(SUM(
+                 CASE
+                   WHEN sn.reading_at IS NOT NULL THEN CASE WHEN COALESCE(fst.performed_at, fst.sale_date::timestamp) >= sn.reading_at THEN fst.sale_volume_liters ELSE 0 END
+                   ELSE fst.sale_volume_liters
+                 END
+               ),0)::int AS sale_out_since,
+               MAX(COALESCE(fst.performed_at, fst.sale_date::timestamp)) AS last_sale_at
+          FROM public.fuel_sale_transfers fst
+          LEFT JOIN (SELECT unit_id, reading_at FROM snaps WHERE rn=1) sn ON sn.unit_id = fst.from_unit_id
+         GROUP BY fst.from_unit_id
+      ),
+
+      sales AS (
+        SELECT lot_id, COALESCE(SUM(sale_volume_liters),0)::int AS sale_only
+          FROM public.fuel_sale_transfers
+         GROUP BY lot_id
+      ),
+      xfer_unit AS (
+        SELECT fit.from_unit_id AS unit_id,
+               COALESCE(SUM(
+                 CASE
+                   WHEN sn.reading_at IS NOT NULL THEN CASE WHEN (fit.transfer_date::timestamp + fit.transfer_time) >= sn.reading_at THEN fit.transfer_volume ELSE 0 END
+                   ELSE fit.transfer_volume
+                 END
+               ),0)::int AS xfer_out_since,
+               MAX(fit.transfer_date::timestamp + fit.transfer_time) AS last_xfer_at
+          FROM public.fuel_internal_transfers fit
+          LEFT JOIN (SELECT unit_id, reading_at FROM snaps WHERE rn=1) sn ON sn.unit_id = fit.from_unit_id
+         WHERE COALESCE(fit.activity,'') <> 'TESTING'
+         GROUP BY fit.from_unit_id
+      ),
+      testing_unit AS (
+        SELECT tst.from_unit_id AS unit_id,
+               COALESCE(SUM(
+                 CASE
+                   WHEN sn.reading_at IS NOT NULL THEN CASE WHEN COALESCE(tst.performed_at, tst.sale_date::timestamp) >= sn.reading_at THEN tst.transfer_volume_liters ELSE 0 END
+                   ELSE tst.transfer_volume_liters
+                 END
+               ),0)::int AS test_out_since,
+               MAX(COALESCE(tst.performed_at, tst.sale_date::timestamp)) AS last_test_at
+          FROM public.testing_self_transfers tst
+          LEFT JOIN (SELECT unit_id, reading_at FROM snaps WHERE rn=1) sn ON sn.unit_id = tst.from_unit_id
+         GROUP BY tst.from_unit_id
+      ),
+      outbound_x AS (
+        SELECT from_lot_id AS lot_id, COALESCE(SUM(transfer_volume),0)::int AS outbound_transfers
+          FROM public.fuel_internal_transfers
+         WHERE COALESCE(activity,'') <> 'TESTING'
+         GROUP BY from_lot_id
+      ),
+      per_lot AS (
+        SELECT l.unit_id, l.lot_id, l.lot_code_created, l.created_at,
+               COALESCE((SELECT fl.loaded_liters FROM public.fuel_lots fl WHERE fl.id=l.lot_id),0) AS loaded_liters,
+               GREATEST(0,
+                 COALESCE((SELECT fl.loaded_liters FROM public.fuel_lots fl WHERE fl.id=l.lot_id),0)
+                 + COALESCE(i.inbound_added,0)
+                 - (COALESCE(o.outbound_transfers,0) + COALESCE(s.sale_only,0))
+               )::int AS remaining
+          FROM lots l
+          LEFT JOIN inbound i ON i.lot_id = l.lot_id
+          LEFT JOIN sales s ON s.lot_id = l.lot_id
+          LEFT JOIN outbound_x o ON o.lot_id = l.lot_id
+      ),
+      agg AS (
+        SELECT unit_id, COALESCE(SUM(remaining),0)::int AS instock_liters
+          FROM per_lot
+         GROUP BY unit_id
+      )
+  SELECT u.id, u.unit_code, u.unit_type, u.capacity_liters, u.vehicle_number,
+             lt.lot_id, lt.lot_code_created,
+             COALESCE(a.instock_liters,0)::int AS instock_liters,
+             COALESCE(s.sale_only,0)::int AS sale_only_liters,
+             COALESCE(sn.reading_liters, NULL) AS latest_snapshot_liters,
+             COALESCE(sn.reading_at, NULL) AS latest_snapshot_at,
+               COALESCE(su.sale_out_since,0)::int AS sale_out_since,
+               COALESCE(xu.xfer_out_since,0)::int AS xfer_out_since,
+               COALESCE(tu.test_out_since,0)::int AS test_out_since,
+               GREATEST(COALESCE(su.last_sale_at, '1970-01-01'::timestamp), COALESCE(xu.last_xfer_at, '1970-01-01'::timestamp), COALESCE(tu.last_test_at, '1970-01-01'::timestamp)) AS last_outbound_at,
+             su.last_sale_at
+        FROM units u
+        LEFT JOIN latest lt ON lt.unit_id = u.id
+        LEFT JOIN sales s ON s.lot_id = lt.lot_id
+        LEFT JOIN agg a ON a.unit_id = u.id
+        LEFT JOIN snaps sn ON sn.unit_id = u.id AND sn.rn = 1
+        LEFT JOIN sale_unit su ON su.unit_id = u.id
+        LEFT JOIN xfer_unit xu ON xu.unit_id = u.id
+        LEFT JOIN testing_unit tu ON tu.unit_id = u.id
+       ORDER BY u.unit_type, u.unit_code
+    `);
+    const items = rows.rows.map(r => ({
+      id: r.id,
+      unit_code: r.unit_code,
+      unit_type: r.unit_type,
+      capacity_liters: Number(r.capacity_liters || 0),
+      vehicle_number: r.vehicle_number || null,
+  lot_id: r.lot_id || null,
+  lot_code_initial: r.lot_code_created || null,
+      instock_liters: Number(r.instock_liters || 0),
+      sale_only_liters: Number(r.sale_only_liters || 0),
+      meter_reading_liters: (() => {
+        const snap = r.latest_snapshot_liters != null ? Number(r.latest_snapshot_liters) : null;
+        // Outbound since latest snapshot (or all-time if no snapshot)
+        const outSince = Number(r.sale_out_since || 0) + Number(r.xfer_out_since || 0) + Number(r.test_out_since || 0);
+        if (snap == null) return outSince;
+        return snap + outSince;
+      })(),
+      latest_snapshot_liters: r.latest_snapshot_liters != null ? Number(r.latest_snapshot_liters) : null,
+      latest_snapshot_at: r.latest_snapshot_at || null,
+      last_sale_at: r.last_sale_at || null,
+      last_outbound_at: r.last_outbound_at || null
+    }));
+    res.json({ items, generatedAt: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create a storage unit (tanker). Restricted to OWNER/ADMIN.
+app.post('/api/fuel-ops/storage-units', requireAuth, requireRole('OWNER','ADMIN'), async (req, res) => {
+  try {
+    const { unit_code, capacity_liters, unit_type, vehicle_number } = req.body || {};
+    const rawType = String(unit_type || 'TRUCK').toUpperCase();
+    // Accept 'STORAGE' from UI and normalize to 'DATUM'
+    const type = rawType === 'STORAGE' ? 'DATUM' : rawType;
+    if (!['TRUCK','DATUM','DISPENSER'].includes(type)) return res.status(400).json({ error: 'unit_type invalid' });
+    const code = (unit_code || '').toString().trim();
+    const cap = parseInt(capacity_liters, 10);
+    if (!code) return res.status(400).json({ error: 'unit_code required' });
+    if (!Number.isFinite(cap) || cap <= 0) return res.status(400).json({ error: 'capacity_liters must be > 0' });
+    const r = await pool.query(
+      `INSERT INTO public.storage_units (unit_type, unit_code, capacity_liters, active, vehicle_number)
+       VALUES ($1,$2,$3,TRUE,$4)
+       ON CONFLICT (unit_code) DO NOTHING
+       RETURNING id, unit_type, unit_code, capacity_liters, active, vehicle_number`,
+      [type, code, cap, vehicle_number || null]
+    );
+    if (!r.rows.length) return res.status(409).json({ error: 'unit_code already exists' });
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Vehicles list shortcut (TRUCK/DATUM)
+app.get('/api/fuel-ops/vehicles', requireAuth, async (req, res) => {
+  try {
+    const type = (req.query.type || '').toString().toUpperCase();
+    if (!['TRUCK','DATUM'].includes(type)) return res.status(400).json({ error: 'type must be TRUCK or DATUM' });
+  const r = await pool.query(`SELECT id, unit_type, unit_code, vehicle_number, capacity_liters, active
+                                 FROM public.storage_units
+                                 WHERE unit_type=$1 AND active=TRUE
+                                 ORDER BY unit_code`, [type]);
+    res.json(r.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Opening suggestions & daily upsert for dispenser and odometer (by truck) ---
+function isoDateOnly(s) {
+  const d = new Date(String(s));
+  if (isNaN(d.getTime())) return null;
+  const y = d.getFullYear(); const m = String(d.getMonth()+1).padStart(2,'0'); const day = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+
+// Format a JS Date to SQL timestamp string in local time (no timezone conversion)
+function toSqlLocalTs(dt) {
+  if (!dt) return null;
+  const d = new Date(dt);
+  if (isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  const ss = String(d.getSeconds()).padStart(2,'0');
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+
+// Get opening suggestion for dispenser liters
+app.get('/api/fuel-ops/opening-suggestion/dispenser', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    // yesterday closing (use day reading logs)
+    const r = await pool.query(
+      `SELECT closing_liters, reading_date FROM public.dispenser_day_reading_logs
+        WHERE truck_id=$1 AND reading_date < $2::date
+        ORDER BY reading_date DESC LIMIT 1`, [truckId, dateStr]
+    );
+    if (r.rows.length) return res.json({ opening: r.rows[0].closing_liters, source: 'yesterday', date: r.rows[0].reading_date });
+    // If none, return null (requires manual opening)
+    res.json({ opening: null, source: 'first' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get opening suggestion for odometer km
+app.get('/api/fuel-ops/opening-suggestion/odometer', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const r = await pool.query(
+      `SELECT closing_km, reading_date FROM public.truck_odometer_day_readings
+        WHERE truck_id=$1 AND reading_date < $2::date
+        ORDER BY reading_date DESC LIMIT 1`, [truckId, dateStr]
+    );
+    if (r.rows.length) return res.json({ opening: r.rows[0].closing_km, source: 'yesterday', date: r.rows[0].reading_date });
+    res.json({ opening: null, source: 'first' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get existing daily dispenser record (proxy to day reading logs)
+app.get('/api/fuel-ops/day/dispenser', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    const r = await pool.query(`SELECT * FROM public.dispenser_day_reading_logs WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    res.json(r.rows[0] || null);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// List all daily dispenser readings for a truck (ascending by date) — use day reading logs
+app.get('/api/fuel-ops/day/dispenser/list', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const r = await pool.query(`SELECT id, truck_id, reading_date, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code, created_by, created_by_user_id, created_at, updated_at FROM public.dispenser_day_reading_logs WHERE truck_id=$1 ORDER BY reading_date ASC`, [truckId]);
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Trips CRUD-lite: list/create/edit for multiple trips per day
+app.get('/api/fuel-ops/trips', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+  if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+  if (!dateStr) return res.status(400).json({ error: 'date invalid' });
+    const r = await pool.query(
+      `SELECT id, truck_id, reading_date, trip_no, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code
+         FROM public.truck_dispenser_trips
+        WHERE truck_id=$1 AND reading_date=$2
+        ORDER BY trip_no ASC`,
+      [truckId, dateStr]
+    );
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fuel-ops/trips', requireAuth, async (req, res) => {
+  try {
+    const { truck_id, date, opening_liters, opening_at, note, driver_name, driver_code } = req.body || {};
+    const truckId = parseInt(truck_id, 10);
+    const dateStr = isoDateOnly(date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!dateStr) return res.status(400).json({ error: 'date invalid' });
+    // Determine next trip number for the given truck and date
+    const nextQ = await pool.query(
+      `SELECT COALESCE(MAX(trip_no),0)+1 AS next
+         FROM public.truck_dispenser_trips
+        WHERE truck_id=$1 AND reading_date=$2`,
+      [truckId, dateStr]
+    );
+    const nextNo = Number(nextQ.rows[0]?.next || 1);
+    // Parse opening_at timestamp if provided
+    let openingTsSql = null;
+    if (opening_at && isValidDateTimeString(opening_at)) {
+      // Preserve local time exactly as provided (avoid UTC conversion)
+      const s = String(opening_at).replace('T',' ').slice(0,19);
+      // Try to normalize via local formatter; if parse fails, keep string
+      const d = new Date(String(s));
+      openingTsSql = !isNaN(d.getTime()) ? toSqlLocalTs(d) : s;
+    }
+    const r = await pool.query(
+      `INSERT INTO public.truck_dispenser_trips (truck_id, reading_date, trip_no, opening_liters, opening_at, note, driver_name, driver_code, created_by, created_by_user_id)
+       VALUES ($1,$2,$3,COALESCE($4,0),$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+  [truckId, dateStr, nextNo, (opening_liters!=null? parseInt(opening_liters,10): null), openingTsSql, note || null, driver_name || null, driver_code || null, getActor(req), req.user?.sub || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/fuel-ops/trips/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const { opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code } = req.body || {};
+    const parts = [];
+    const vals = [];
+    let idx = 1;
+    if (opening_liters != null) { parts.push(`opening_liters=$${idx++}`); vals.push(parseInt(opening_liters,10)); }
+    if (closing_liters != null) { parts.push(`closing_liters=$${idx++}`); vals.push(parseInt(closing_liters,10)); }
+    if (opening_at) {
+      const s = String(opening_at).replace('T',' ').slice(0,19);
+      const d = new Date(String(s));
+      parts.push(`opening_at=$${idx++}`);
+      vals.push(!isNaN(d.getTime()) ? toSqlLocalTs(d) : s);
+    }
+    if (closing_at) {
+      const s = String(closing_at).replace('T',' ').slice(0,19);
+      const d = new Date(String(s));
+      parts.push(`closing_at=$${idx++}`);
+      vals.push(!isNaN(d.getTime()) ? toSqlLocalTs(d) : s);
+    }
+    if (note !== undefined) { parts.push(`note=$${idx++}`); vals.push(note || null); }
+    // Accept driver fields so UI can persist driver selection on trip updates
+    if (driver_name !== undefined) { parts.push(`driver_name=$${idx++}`); vals.push(driver_name || null); }
+    if (driver_code !== undefined) { parts.push(`driver_code=$${idx++}`); vals.push(driver_code || null); }
+    if (!parts.length) return res.status(400).json({ error: 'no fields to update' });
+    parts.push(`updated_at=NOW()`);
+    vals.push(id);
+    const r = await pool.query(`UPDATE public.truck_dispenser_trips SET ${parts.join(', ')} WHERE id=$${idx} RETURNING *`, vals);
+    if (!r.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete a trip. Safety: allow deletion ONLY for the last trip of the day to avoid gaps.
+app.delete('/api/fuel-ops/trips/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const q = await pool.query(`SELECT id, truck_id, reading_date, trip_no FROM public.truck_dispenser_trips WHERE id=$1`, [id]);
+    if (!q.rows.length) return res.status(404).json({ error: 'not found' });
+    const row = q.rows[0];
+    const m = await pool.query(`SELECT MAX(trip_no) AS max_no FROM public.truck_dispenser_trips WHERE truck_id=$1 AND reading_date=$2`, [row.truck_id, row.reading_date]);
+    const maxNo = Number(m.rows[0]?.max_no || 0);
+    if (row.trip_no !== maxNo) return res.status(400).json({ error: 'only the last trip for the day can be deleted' });
+    await pool.query(`DELETE FROM public.truck_dispenser_trips WHERE id=$1`, [id]);
+    res.json({ ok: true, deleted_id: id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Upsert daily dispenser record
+// Upsert daily dispenser record (migrated to use dispenser_day_reading_logs)
+// This endpoint will create a day log entry and also create opening/closing meter snapshots.
+app.post('/api/fuel-ops/day/dispenser', requireAuth, async (req, res) => {
+  try {
+    const { truck_id, date, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code } = req.body || {};
+    const truckId = parseInt(truck_id, 10);
+    const dateStr = isoDateOnly(date || new Date());
+    const open = Number(opening_liters);
+    const close = (closing_liters == null) ? null : Number(closing_liters);
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!Number.isFinite(open) || open < 0) return res.status(400).json({ error: 'opening_liters invalid' });
+    if (close != null && (!Number.isFinite(close) || close < open)) return res.status(400).json({ error: 'closing_liters must be >= opening' });
+    // Reject if record for same date exists (create-only)
+    const exists = await pool.query(`SELECT 1 FROM public.dispenser_day_reading_logs WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    if (exists.rowCount > 0) {
+      const [y,m,d] = dateStr.split('-');
+      return res.status(409).json({ error: `readings are submitted for ${d}/${m}/${y}. to edit go to edit button.` });
+    }
+    // Normalize timestamps
+    let openingTs = null, closingTs = null;
+    if (opening_at && isValidDateTimeString(opening_at)) openingTs = new Date(String(opening_at));
+    if (closing_at && isValidDateTimeString(closing_at)) closingTs = new Date(String(closing_at));
+    if (!openingTs) openingTs = new Date(`${dateStr}T00:00:00`);
+    if (!closingTs && close != null) closingTs = new Date(`${dateStr}T23:59:59`);
+    const openingSql = openingTs ? toSqlLocalTs(openingTs) : `${dateStr} 00:00:00`;
+    const closingSql = closingTs ? toSqlLocalTs(closingTs) : null;
+    const su = await pool.query(`SELECT unit_code FROM public.storage_units WHERE id=$1`, [truckId]);
+    const truckCode = su.rows.length ? su.rows[0].unit_code : null;
+    const r = await pool.query(
+      `INSERT INTO public.dispenser_day_reading_logs (truck_id, truck_code, reading_date, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code, created_by, created_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       RETURNING *`,
+      [truckId, truckCode, dateStr, open, close, openingSql, closingSql, note || null, driver_name || null, driver_code || null, getActor(req), req.user?.sub || null]
+    );
+    // Also create opening/closing snapshots if closing provided
+    try {
+      await pool.query(`INSERT INTO public.truck_dispenser_meter_snapshots (truck_id, reading_at, reading_liters, source, note, created_by, created_by_user_id) VALUES ($1,$2,$3,'OPENING',$4,$5,$6)`, [truckId, openingSql, open, 'Opening snapshot', getActor(req), req.user?.sub || null]);
+      if (closingSql) await pool.query(`INSERT INTO public.truck_dispenser_meter_snapshots (truck_id, reading_at, reading_liters, source, note, created_by, created_by_user_id) VALUES ($1,$2,$3,'CLOSING',$4,$5,$6)`, [truckId, closingSql, close, 'Closing snapshot', getActor(req), req.user?.sub || null]);
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[snapshots insert warn]', e.message); }
+    res.status(201).json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// New: Day reading logs CRUD for dispenser_day_reading_logs
+app.get('/api/fuel-ops/day/logs', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!dateStr) return res.status(400).json({ error: 'invalid date' });
+    const r = await pool.query(`SELECT * FROM public.dispenser_day_reading_logs WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    res.json(r.rows[0] || null);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/fuel-ops/day/logs/list', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const r = await pool.query(`SELECT id, truck_id, reading_date, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code, created_by, created_by_user_id, created_at, updated_at FROM public.dispenser_day_reading_logs WHERE truck_id=$1 ORDER BY reading_date ASC`, [truckId]);
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fuel-ops/day/logs', requireAuth, async (req, res) => {
+  try {
+    const { truck_id, date, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code } = req.body || {};
+    const truckId = parseInt(truck_id, 10);
+    const dateStr = isoDateOnly(date || new Date());
+    const open = Number(opening_liters);
+    const close = (closing_liters == null) ? null : Number(closing_liters);
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!Number.isFinite(open) || open < 0) return res.status(400).json({ error: 'opening_liters invalid' });
+    if (close != null && (!Number.isFinite(close) || close < open)) return res.status(400).json({ error: 'closing_liters must be >= opening' });
+    // Reject if record for same date exists (create-only)
+    const exists = await pool.query(`SELECT 1 FROM public.dispenser_day_reading_logs WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    if (exists.rowCount > 0) return res.status(409).json({ error: 'readings already submitted for this date' });
+    // Normalize timestamps: coerce user-entered values to local SQL timestamp strings
+    let openingSql = null;
+    let closingSql = null;
+    // Resolve truck_code for easier lookups and to store denormalized code
+    let truckCode = null;
+    try {
+      const su = await pool.query(`SELECT unit_code FROM public.storage_units WHERE id=$1`, [truckId]);
+      truckCode = su.rows.length ? su.rows[0].unit_code : null;
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[day/logs truck_code lookup warn]', e.message); }
+    if (opening_at) openingSql = coerceLocalSqlTimestamp(String(opening_at));
+    if (!openingSql) openingSql = `${dateStr} 00:00:00`;
+    if (closing_at) closingSql = coerceLocalSqlTimestamp(String(closing_at));
+    // closingSql may remain null if no closing provided
+    const r = await pool.query(
+      `INSERT INTO public.dispenser_day_reading_logs (truck_id, truck_code, reading_date, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code, created_by, created_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       RETURNING *`,
+      [truckId, truckCode, dateStr, open, close, openingSql, closingSql, note || null, driver_name || null, driver_code || null, getActor(req), req.user?.sub || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/fuel-ops/day/logs/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const { opening_liters, closing_liters, opening_at, closing_at, note } = req.body || {};
+    const parts = [];
+    const vals = [];
+    let idx = 1;
+    if (opening_liters != null) { parts.push(`opening_liters=$${idx++}`); vals.push(parseInt(opening_liters,10)); }
+    if (closing_liters != null) { parts.push(`closing_liters=$${idx++}`); vals.push(parseInt(closing_liters,10)); }
+    if (opening_at) {
+      const coerced = coerceLocalSqlTimestamp(String(opening_at));
+      parts.push(`opening_at=$${idx++}`);
+      vals.push(coerced || String(opening_at).replace('T',' ').slice(0,19));
+    }
+    if (closing_at) {
+      const coerced = coerceLocalSqlTimestamp(String(closing_at));
+      parts.push(`closing_at=$${idx++}`);
+      vals.push(coerced || String(closing_at).replace('T',' ').slice(0,19));
+    }
+    if (note !== undefined) { parts.push(`note=$${idx++}`); vals.push(note || null); }
+    if (!parts.length) return res.status(400).json({ error: 'no fields to update' });
+    parts.push(`updated_at=NOW()`);
+    vals.push(id);
+    const r = await pool.query(`UPDATE public.dispenser_day_reading_logs SET ${parts.join(', ')} WHERE id=$${idx} RETURNING *`, vals);
+    if (!r.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete a day reading log by id
+app.delete('/api/fuel-ops/day/logs/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const del = await pool.query(`DELETE FROM public.dispenser_day_reading_logs WHERE id=$1 RETURNING id, truck_id`, [id]);
+    if (!del.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true, deleted_id: del.rows[0].id, truck_id: del.rows[0].truck_id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Edit daily dispenser record (allow updating closing liters, times, testing, note, driver fields)
+// Edit daily dispenser record (migrated to operate on dispenser_day_reading_logs)
+app.patch('/api/fuel-ops/day/dispenser', requireAuth, async (req, res) => {
+  try {
+    const { truck_id, date, opening_liters, closing_liters, opening_at, closing_at, note, driver_name, driver_code } = req.body || {};
+    const truckId = parseInt(truck_id, 10);
+    const dateStr = isoDateOnly(date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const existingQ = await pool.query(`SELECT * FROM public.dispenser_day_reading_logs WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    if (!existingQ.rows.length) return res.status(404).json({ error: 'day reading not found' });
+    const existing = existingQ.rows[0];
+    const open = opening_liters != null ? Number(opening_liters) : Number(existing.opening_liters);
+    const close = closing_liters != null ? Number(closing_liters) : Number(existing.closing_liters);
+    if (!Number.isFinite(open) || open < 0) return res.status(400).json({ error: 'opening_liters invalid' });
+    if (close != null && (!Number.isFinite(close) || close < open)) return res.status(400).json({ error: 'closing_liters must be >= opening' });
+    // Parse/normalize timestamps (optional updates)
+    let openingTs = existing.opening_at ? new Date(existing.opening_at) : new Date(`${dateStr}T00:00:00`);
+    let closingTs = existing.closing_at ? new Date(existing.closing_at) : (existing.closing_liters != null ? new Date(`${dateStr}T23:59:59`) : null);
+    if (opening_at && isValidDateTimeString(opening_at)) openingTs = new Date(String(opening_at));
+    if (closing_at && isValidDateTimeString(closing_at)) closingTs = new Date(String(closing_at));
+    if (isNaN(openingTs.getTime()) || (closingTs && isNaN(closingTs.getTime()))) return res.status(400).json({ error: 'opening_at/closing_at invalid' });
+    const parts = [];
+    const vals = [];
+    let idx = 1;
+    parts.push(`opening_liters=$${idx++}`); vals.push(open);
+    parts.push(`closing_liters=$${idx++}`); vals.push(close != null ? close : null);
+    parts.push(`opening_at=$${idx++}`); vals.push(toSqlLocalTs(openingTs));
+    parts.push(`closing_at=$${idx++}`); vals.push(closingTs ? toSqlLocalTs(closingTs) : null);
+    parts.push(`note=$${idx++}`); vals.push(note != null ? note : existing.note);
+    parts.push(`driver_name=$${idx++}`); vals.push(driver_name != null ? driver_name : existing.driver_name);
+    parts.push(`driver_code=$${idx++}`); vals.push(driver_code != null ? driver_code : existing.driver_code);
+    parts.push(`updated_at=NOW()`);
+    vals.push(truckId); vals.push(dateStr);
+    const upd = await pool.query(`UPDATE public.dispenser_day_reading_logs SET ${parts.join(', ')} WHERE truck_id=$${idx++} AND reading_date=$${idx} RETURNING *`, vals);
+    if (!upd.rows.length) return res.status(404).json({ error: 'not found' });
+    // Optionally create adjustment snapshots when opening/closing changed
+    try {
+      const changedOpening = open !== Number(existing.opening_liters);
+      const changedClosing = (close != null && close !== Number(existing.closing_liters));
+      if (changedOpening) {
+        await pool.query(`INSERT INTO public.truck_dispenser_meter_snapshots (truck_id, reading_at, reading_liters, source, note, created_by, created_by_user_id) VALUES ($1,$2,$3,'OPENING_EDIT',$4,$5,$6)`, [truckId, toSqlLocalTs(openingTs), open, 'Edited opening liters', getActor(req), req.user?.sub || null]);
+      }
+      if (changedClosing) {
+        await pool.query(`INSERT INTO public.truck_dispenser_meter_snapshots (truck_id, reading_at, reading_liters, source, note, created_by, created_by_user_id) VALUES ($1,$2,$3,'CLOSING_EDIT',$4,$5,$6)`, [truckId, toSqlLocalTs(closingTs), close, 'Edited closing liters', getActor(req), req.user?.sub || null]);
+      }
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[edit snapshots warn]', e.message); }
+    res.json(upd.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Truck dispenser meter snapshots: create & list
+app.post('/api/fuel-ops/meter-snapshots', requireAuth, async (req, res) => {
+  try {
+    const { truck_id, reading_liters, reading_at, note } = req.body || {};
+    const tid = parseInt(truck_id, 10);
+    const val = Number(reading_liters);
+    if (!Number.isFinite(tid) || tid <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!Number.isFinite(val) || val < 0) return res.status(400).json({ error: 'reading_liters must be >= 0' });
+    // Preserve user-entered local date/time exactly as a wall-clock timestamp (no UTC shift)
+    let tsSql = null;
+    if (reading_at) {
+      if (!isValidDateTimeString(String(reading_at))) return res.status(400).json({ error: 'reading_at invalid' });
+      tsSql = coerceLocalSqlTimestamp(String(reading_at));
+      if (!tsSql) return res.status(400).json({ error: 'reading_at invalid' });
+    } else {
+      tsSql = fmtSqlTsLocal(new Date());
+    }
+    const su = await pool.query(`SELECT id, unit_type FROM public.storage_units WHERE id=$1`, [tid]);
+    if (!su.rows.length) return res.status(400).json({ error: 'Unknown storage unit' });
+    if (!['TRUCK','DATUM'].includes(su.rows[0].unit_type)) {
+      return res.status(400).json({ error: 'Unsupported unit type for meter snapshot' });
+    }
+    const r = await pool.query(`
+      INSERT INTO public.truck_dispenser_meter_snapshots (truck_id, reading_at, reading_liters, source, note, created_by, created_by_user_id)
+      VALUES ($1,$2,$3,'SNAPSHOT',$4,$5,$6)
+      RETURNING id, truck_id, reading_at, reading_liters, source, note, created_at
+    `, [tid, tsSql, val, note || null, getActor(req), req.user?.sub || null]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/fuel-ops/meter-snapshots', requireAuth, async (req, res) => {
+  try {
+    const tid = parseInt(req.query.truck_id, 10);
+    const fromStr = req.query.from ? String(req.query.from) : null;
+    const toStr = req.query.to ? String(req.query.to) : null;
+    const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit || '200', 10) || 200));
+    if (!Number.isFinite(tid) || tid <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const params = [tid];
+    let where = ' WHERE truck_id = $1';
+    if (fromStr && isValidDateTimeString(fromStr)) {
+      const fSql = coerceLocalSqlTimestamp(fromStr);
+      if (fSql) { params.push(fSql); where += ` AND reading_at >= $${params.length}`; }
+    }
+    if (toStr && isValidDateTimeString(toStr)) {
+      const tSql = coerceLocalSqlTimestamp(toStr);
+      if (tSql) { params.push(tSql); where += ` AND reading_at <= $${params.length}`; }
+    }
+    const sql = `SELECT id, truck_id, reading_at, reading_liters, source, note, created_at
+                   FROM public.truck_dispenser_meter_snapshots
+                   ${where}
+                   ORDER BY reading_at DESC
+                   LIMIT ${limit}`;
+    const r = await pool.query(sql, params);
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Daily reconciliation for a truck and date
+app.get('/api/fuel-ops/reconcile/daily', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!dateStr) return res.status(400).json({ error: 'date invalid' });
+
+    // We'll prefer sources in this order:
+    // 1) dispenser_day_reading_logs (authoritative operator-entered logs)
+    // 2) truck_dispenser_meter_snapshots (preferred local snapshot near day bounds)
+    // 3) trip-level readings (earliest opening_at and latest closing_at recorded for trips on that date)
+    // 4) fallback to day bounds (00:00:00 / 23:59:59)
+
+    // Use dispenser_day_reading_logs as the authoritative source for opening/closing readings.
+    // The legacy `truck_dispenser_day_readings` table is no longer required for reconciliation.
+    let O = 0, C = 0; // opening and closing meter liters
+    let openSQL = null, closeSQL = null; // SQL-local timestamp window strings
+    let meterDeltaAvailable = false;
+
+    let Lrow = null;
+    try {
+      const logsQ = await pool.query(`SELECT * FROM public.dispenser_day_reading_logs WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+      if (logsQ.rows.length) {
+        Lrow = logsQ.rows[0];
+        O = Number(Lrow.opening_liters || 0);
+        C = Number(Lrow.closing_liters || 0);
+        meterDeltaAvailable = (Lrow.opening_liters != null && Lrow.closing_liters != null);
+        openSQL = Lrow.opening_at ? toSqlLocalTs(Lrow.opening_at) : `${dateStr} 00:00:00`;
+        closeSQL = Lrow.closing_at ? toSqlLocalTs(Lrow.closing_at) : `${dateStr} 23:59:59`;
+      }
+    } catch (e) {
+      if (!process.env.SUPPRESS_DB_LOG) console.warn('[reconcile logs lookup warn]', e.message);
+      // leave O/C as 0 and fall through to day bounds fallback below
+    }
+
+    // Helper day bounds
+    const dayStart = `${dateStr} 00:00:00`;
+    const dayEnd = `${dateStr} 23:59:59`;
+
+    // If logs didn't provide timestamps/values, we'll fall back to day bounds below and leave
+    // meterDeltaAvailable=false which signals the UI that meter-derived delta is unavailable.
+
+    // Final fallback: if openSQL/closeSQL still missing, use day bounds
+    if (!openSQL) openSQL = dayStart;
+    if (!closeSQL) closeSQL = dayEnd;
+    // Sales within window
+    const salesQ = await pool.query(`
+      SELECT COALESCE(SUM(sale_volume_liters),0)::int AS s
+        FROM public.fuel_sale_transfers
+       WHERE from_unit_id=$1 AND performed_at >= $2::timestamp AND performed_at <= $3::timestamp
+    `, [truckId, openSQL, closeSQL]);
+    const S = Number(salesQ.rows[0]?.s || 0);
+    // Internal transfers out/in
+    const toutQ = await pool.query(`
+      SELECT COALESCE(SUM(transfer_volume),0)::int AS t
+        FROM public.fuel_internal_transfers
+       WHERE from_unit_id=$1 AND COALESCE(activity,'') <> 'TESTING' AND (transfer_date::timestamp + transfer_time) >= $2::timestamp AND (transfer_date::timestamp + transfer_time) <= $3::timestamp
+    `, [truckId, openSQL, closeSQL]);
+    const tinQ = await pool.query(`
+      SELECT COALESCE(SUM(transfer_volume),0)::int AS t
+        FROM public.fuel_internal_transfers
+       WHERE to_unit_id=$1 AND COALESCE(activity,'') <> 'TESTING' AND (transfer_date::timestamp + transfer_time) >= $2::timestamp AND (transfer_date::timestamp + transfer_time) <= $3::timestamp
+    `, [truckId, openSQL, closeSQL]);
+    const T_out = Number(toutQ.rows[0]?.t || 0);
+  const T_in = Number(tinQ.rows[0]?.t || 0);
+    // Include any testing transfers logged as internal transfers for this truck in the same window
+    const testingTransfersQ = await pool.query(
+      `SELECT COALESCE((SELECT SUM(transfer_volume_liters) FROM public.testing_self_transfers WHERE from_unit_id=$1 AND performed_at >= $2::timestamp AND performed_at <= $3::timestamp),0) AS t`,
+      [truckId, openSQL, closeSQL]
+    );
+    const T_test = (Lrow ? Number(Lrow.testing_used_liters || 0) : 0) + Number(testingTransfersQ.rows[0]?.t || 0);
+    const deltaM = meterDeltaAvailable ? Number((C - O).toFixed(3)) : null;
+    // Dispenser meters only increase on outflow (sales, transfers out, testing). Transfer-in does not affect the meter.
+    const deltaE = Number((S + T_out + T_test).toFixed(3));
+    const delta = (deltaM == null) ? null : Number((deltaM - deltaE).toFixed(3));
+    // Human-readable note about discrepancy
+    let note = null;
+    if (delta == null) {
+      note = 'Meter delta unavailable (no day reading or insufficient snapshots)';
+    } else if (delta > 0) {
+      note = `Meter reading is more by ${Math.abs(delta)} than transfers and sales`;
+    } else if (delta < 0) {
+      note = `Meter reading is less by ${Math.abs(delta)} than transfers and sales`;
+    } else {
+      note = 'Meter matches transfers and sales';
+    }
+    res.json({
+      truck_id: truckId,
+      date: dateStr,
+      opening: O,
+      opening_at: openSQL,
+      closing: C,
+      closing_at: closeSQL,
+      sales: S,
+      transfers_out: T_out,
+      transfers_in: T_in,
+      testing_used_liters: T_test,
+      delta_meter: deltaM,
+      delta_expected: deltaE,
+      delta_difference: delta,
+      note
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Off-hours summary between two timestamps for a truck
+app.get('/api/fuel-ops/offhours', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const fromStr = req.query.from;
+    const toStr = req.query.to;
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!isValidDateTimeString(fromStr) || !isValidDateTimeString(toStr)) return res.status(400).json({ error: 'from/to invalid' });
+    const fromSQL = new Date(String(fromStr)).toISOString().replace('T',' ').slice(0,19);
+    const toSQL = new Date(String(toStr)).toISOString().replace('T',' ').slice(0,19);
+    // Meter delta from snapshots if both ends exist; else null
+    const startSnap = await pool.query(`SELECT reading_liters FROM public.truck_dispenser_meter_snapshots WHERE truck_id=$1 AND reading_at <= $2 ORDER BY reading_at DESC LIMIT 1`, [truckId, fromSQL]);
+    const endSnap = await pool.query(`SELECT reading_liters FROM public.truck_dispenser_meter_snapshots WHERE truck_id=$1 AND reading_at >= $2 ORDER BY reading_at ASC LIMIT 1`, [truckId, toSQL]);
+    const meterDelta = (startSnap.rows.length && endSnap.rows.length) ? Number(endSnap.rows[0].reading_liters) - Number(startSnap.rows[0].reading_liters) : null;
+  const transfersOutQ = await pool.query(`SELECT COALESCE(SUM(transfer_volume),0)::int AS t FROM public.fuel_internal_transfers WHERE from_unit_id=$1 AND COALESCE(activity,'') <> 'TESTING' AND (transfer_date::timestamp + transfer_time) >= $2 AND (transfer_date::timestamp + transfer_time) <= $3`, [truckId, fromSQL, toSQL]);
+  const transfersInQ = await pool.query(`SELECT COALESCE(SUM(transfer_volume),0)::int AS t FROM public.fuel_internal_transfers WHERE to_unit_id=$1 AND COALESCE(activity,'') <> 'TESTING' AND (transfer_date::timestamp + transfer_time) >= $2 AND (transfer_date::timestamp + transfer_time) <= $3`, [truckId, fromSQL, toSQL]);
+    const salesQ = await pool.query(`SELECT COALESCE(SUM(sale_volume_liters),0)::int AS s FROM public.fuel_sale_transfers WHERE from_unit_id=$1 AND performed_at >= $2 AND performed_at <= $3`, [truckId, fromSQL, toSQL]);
+    const T_out = Number(transfersOutQ.rows[0]?.t || 0);
+  const T_in = Number(transfersInQ.rows[0]?.t || 0);
+    const S = Number(salesQ.rows[0]?.s || 0);
+  // Count testing transfers in the off-hours expected meter delta (meters advance on outflow)
+  const testingOffQ = await pool.query(
+    `SELECT COALESCE((SELECT SUM(transfer_volume_liters) FROM public.testing_self_transfers WHERE from_unit_id=$1 AND performed_at >= $2 AND performed_at <= $3),0) AS t`,
+    [truckId, fromSQL, toSQL]
+  );
+  const T_test_off = Number(testingOffQ.rows[0]?.t || 0);
+  const expected = S + T_out + T_test_off;
+    const residual = (meterDelta == null) ? null : Number((meterDelta - expected).toFixed(3));
+    res.json({
+      truck_id: truckId,
+      from: fromSQL,
+      to: toSQL,
+      meter_delta: meterDelta,
+      sales: S,
+      transfers_out: T_out,
+      transfers_in: T_in,
+      expected_delta: expected,
+      residual
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get existing daily odometer record
+app.get('/api/fuel-ops/day/odometer', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    const r = await pool.query(`SELECT * FROM public.truck_odometer_day_readings WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    res.json(r.rows[0] || null);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Upsert daily odometer record
+app.post('/api/fuel-ops/day/odometer', requireAuth, async (req, res) => {
+  try {
+    const { truck_id, date, opening_km, closing_km, note, driver_name, driver_code, opening_time, closing_time, opening_at, closing_at } = req.body || {};
+    const truckId = parseInt(truck_id, 10);
+    const dateStr = isoDateOnly(date || new Date());
+    const open = Number(opening_km);
+    const close = Number(closing_km);
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!Number.isFinite(open) || open < 0) return res.status(400).json({ error: 'opening_km invalid' });
+    if (!Number.isFinite(close) || close < open) return res.status(400).json({ error: 'closing_km must be >= opening' });
+    const exists = await pool.query(`SELECT 1 FROM public.truck_odometer_day_readings WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    if (exists.rowCount > 0) {
+      const [y,m,d] = dateStr.split('-');
+      return res.status(409).json({ error: `readings are submitted for ${d}/${m}/${y}. to edit go to edit button.` });
+    }
+    // derive opening_at/closing_at from HH:mm or full timestamp
+    function buildTs(hhmm, overrideTs) {
+      try {
+        if (overrideTs) return new Date(overrideTs);
+        const t = (hhmm || '').toString().trim();
+        if (!t) return null;
+        const [hh, mm] = t.split(':');
+        if (hh == null || mm == null) return null;
+        return new Date(`${dateStr}T${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:00`);
+      } catch { return null; }
+    }
+    const openingAtTs = buildTs(opening_time, opening_at);
+    const closingAtTs = buildTs(closing_time, closing_at);
+    const r = await pool.query(
+      `INSERT INTO public.truck_odometer_day_readings (truck_id, reading_date, opening_km, closing_km, note, driver_name, driver_code, opening_at, closing_at, created_by, created_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [truckId, dateStr, open, close, note || null, driver_name || null, driver_code || null, openingAtTs, closingAtTs, getActor(req), req.user?.sub || null]
+    );
+    res.status(201).json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Edit daily odometer record
+app.patch('/api/fuel-ops/day/odometer', requireAuth, async (req, res) => {
+  try {
+    const { truck_id, date, opening_km, closing_km, note, driver_name, driver_code, opening_time, closing_time, opening_at, closing_at } = req.body || {};
+    const truckId = parseInt(truck_id, 10);
+    const dateStr = isoDateOnly(date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const existingQ = await pool.query(`SELECT * FROM public.truck_odometer_day_readings WHERE truck_id=$1 AND reading_date=$2`, [truckId, dateStr]);
+    if (!existingQ.rows.length) return res.status(404).json({ error: 'day reading not found' });
+    const existing = existingQ.rows[0];
+    const open = opening_km != null ? Number(opening_km) : Number(existing.opening_km);
+    const close = closing_km != null ? Number(closing_km) : Number(existing.closing_km);
+    if (!Number.isFinite(open) || open < 0) return res.status(400).json({ error: 'opening_km invalid' });
+    if (!Number.isFinite(close) || close < open) return res.status(400).json({ error: 'closing_km must be >= opening' });
+    function buildTs(hhmm, overrideTs, fallback) {
+      try {
+        if (overrideTs != null) return new Date(overrideTs);
+        const t = (hhmm || '').toString().trim();
+        if (!t) return fallback;
+        const [hh, mm] = t.split(':');
+        if (hh == null || mm == null) return fallback;
+        return new Date(`${dateStr}T${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:00`);
+      } catch { return fallback; }
+    }
+    const openingAtTs = buildTs(opening_time, opening_at, existing.opening_at || null);
+    const closingAtTs = buildTs(closing_time, closing_at, existing.closing_at || null);
+    const upd = await pool.query(`
+      UPDATE public.truck_odometer_day_readings
+         SET opening_km=$3,
+             closing_km=$4,
+             note=$5,
+             driver_name=$6,
+             driver_code=$7,
+             opening_at=$8,
+             closing_at=$9,
+             updated_at=NOW()
+       WHERE truck_id=$1 AND reading_date=$2
+       RETURNING *
+    `, [truckId, dateStr, open, close, note != null ? note : existing.note, driver_name != null ? driver_name : existing.driver_name, driver_code != null ? driver_code : existing.driver_code, openingAtTs, closingAtTs]);
+    res.json(upd.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// List daily odometer records for a truck (descending by date)
+app.get('/api/fuel-ops/day/odometer/list', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const limit = Math.max(1, Math.min(365, parseInt(req.query.limit || '90', 10) || 90));
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const r = await pool.query(`SELECT id, truck_id, reading_date, opening_km, closing_km, opening_at, closing_at, note, driver_name, driver_code, created_at, updated_at
+                                  FROM public.truck_odometer_day_readings
+                                 WHERE truck_id=$1
+                                 ORDER BY reading_date DESC
+                                 LIMIT $2`, [truckId, limit]);
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete a daily odometer record (by id or truck/date)
+app.delete('/api/fuel-ops/day/odometer', requireAuth, async (req, res) => {
+  try {
+    const idRaw = req.query.id;
+    if (idRaw) {
+      const id = parseInt(idRaw, 10);
+      if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+      const del = await pool.query(`DELETE FROM public.truck_odometer_day_readings WHERE id=$1 RETURNING id`, [id]);
+      if (!del.rows.length) return res.status(404).json({ error: 'not found' });
+      return res.json({ ok: true, deleted_id: id });
+    }
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    const del = await pool.query(`DELETE FROM public.truck_odometer_day_readings WHERE truck_id=$1 AND reading_date=$2 RETURNING id`, [truckId, dateStr]);
+    if (!del.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true, deleted_id: del.rows[0].id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// =========================
+// Listing endpoints for Loads subtabs
+// =========================
+
+// Determine fuel_lots date column name at runtime (supports load_date vs loaded_date)
+let FUEL_LOTS_DATE_COL = null;
+async function resolveFuelLotsDateCol() {
+  if (FUEL_LOTS_DATE_COL) return FUEL_LOTS_DATE_COL;
+  try {
+    const q = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='fuel_lots'
+           AND column_name IN ('load_date','loaded_date')
+         ORDER BY CASE column_name WHEN 'load_date' THEN 1 ELSE 2 END LIMIT 1`
+    );
+    FUEL_LOTS_DATE_COL = (q.rows[0] && q.rows[0].column_name) || 'loaded_date';
+  } catch { FUEL_LOTS_DATE_COL = 'loaded_date'; }
+  return FUEL_LOTS_DATE_COL;
+}
+
+// Recent lots for a unit (tanker or datum)
+app.get('/api/fuel-ops/lots/list', requireAuth, async (req, res) => {
+  try {
+    const dateCol = await resolveFuelLotsDateCol();
+    const unitIdRaw = req.query.unit_id;
+    const unitId = unitIdRaw != null ? parseInt(unitIdRaw, 10) : null;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10) || 50));
+    const loadType = (req.query.load_type || '').toString().toUpperCase(); // PURCHASE | EMPTY_TRANSFER
+    const unitType = (req.query.unit_type || '').toString().toUpperCase(); // TRUCK | DATUM
+    // When unit_id omitted, return recent lots across all TRUCK/DATUM units (active only)
+    let params = [];
+    let sqlBase = `FROM public.fuel_lots fl
+                   JOIN public.storage_units su ON su.id = fl.unit_id
+                  WHERE su.active=TRUE`;
+    if (unitType && ['TRUCK','DATUM'].includes(unitType)) {
+      params.push(unitType);
+      sqlBase += ` AND su.unit_type = $${params.length}`;
+    } else {
+      sqlBase += ` AND su.unit_type IN ('TRUCK','DATUM')`;
+    }
+    if (loadType && ['PURCHASE','EMPTY_TRANSFER'].includes(loadType)) {
+      params.push(loadType);
+      sqlBase += ` AND fl.load_type = $${params.length}`;
+    }
+    // Extended computed columns for purchase display:
+    // remaining_liters: clamp to 0 when SOLD else loaded - used (no inbound adds considered here; UI wants purchase perspective)
+    // transfer_volume_liters: when SOLD and used > loaded (indicates tanker-to-tanker transfers increasing used counter beyond initial load)
+    // transfer_to_unit_codes: list of distinct destination tanker codes this lot transferred to
+  // Use the detected date column and expose as load_date for the UI.
+  const selectCols = `SELECT fl.id, fl.unit_id,
+                 fl.${dateCol} AS load_date,
+                 fl.loaded_liters, fl.used_liters, fl.stock_status,
+                 fl.lot_code_created AS lot_code_initial, fl.created_at, fl.load_time, fl.load_type, su.unit_code, su.unit_type,
+                               CASE WHEN fl.stock_status='SOLD' THEN 0 ELSE GREATEST(0, fl.loaded_liters - fl.used_liters) END::int AS remaining_liters,
+                               (
+                                 SELECT COALESCE(SUM(fit.transfer_volume) FILTER (WHERE COALESCE(fit.activity,'') <> 'TESTING'),0)::int
+                                   FROM public.fuel_internal_transfers fit
+                                  WHERE fit.to_lot_id = fl.id
+                               ) AS transfer_volume_liters,
+                               (
+                                 SELECT string_agg(DISTINCT fit.to_unit_code, ',')
+                                   FROM public.fuel_internal_transfers fit
+                                 WHERE fit.from_lot_id = fl.id AND fit.to_unit_code IS NOT NULL
+                               ) AS transfer_to_unit_codes`;
+    if (Number.isFinite(unitId) && unitId > 0) {
+      // Reset params for clarity per-branch
+      const p = [unitId];
+      let where = ' WHERE fl.unit_id=$1';
+      if (loadType && ['PURCHASE','EMPTY_TRANSFER'].includes(loadType)) {
+        p.push(loadType); where += ` AND fl.load_type = $${p.length}`;
+      }
+  const sql = `${selectCols}
+       FROM public.fuel_lots fl
+       JOIN public.storage_units su ON su.id = fl.unit_id
+       ${where}
+       ORDER BY COALESCE(fl.load_time, fl.created_at) DESC, fl.id DESC
+       LIMIT ${limit}`;
+      const r = await pool.query(sql, p);
+      return res.json({ items: r.rows });
+    }
+    // All units path
+  const sql = `${selectCols}
+         ${sqlBase}
+         ORDER BY COALESCE(fl.load_time, fl.created_at) DESC, fl.id DESC
+         LIMIT ${limit}`;
+    const r = await pool.query(sql, params);
+    return res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Internal transfers for a unit (as source or destination)
+// NOTE: Removed Internal Transfers listing endpoint as per requirement
+
+// Sale transfers for a source unit
+app.get('/api/fuel-ops/transfers/sales', requireAuth, async (req, res) => {
+  try {
+    const unitId = parseInt(req.query.unit_id, 10);
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10) || 50));
+    if (!Number.isFinite(unitId) || unitId <= 0) return res.status(400).json({ error: 'unit_id required' });
+    const uq = await pool.query(`SELECT unit_code FROM public.storage_units WHERE id=$1`, [unitId]);
+    const unitCode = (uq.rows[0] && uq.rows[0].unit_code) || null;
+    const params = [unitId, limit, unitCode];
+    // Combine canonical sales with TESTING internal transfers (mapped) so TESTING filled-back-to-same appears in lists
+    const r = await pool.query(
+        `SELECT * FROM (
+           SELECT fst.id, fst.lot_id, fst.from_unit_id, fst.from_unit_code, fst.to_vehicle,
+                  fst.sale_volume_liters AS volume_liters,
+                  fl.lot_code_created AS lot_code_initial,
+                  fst.lot_code_after AS lot_code_by_transfer,
+                  fst.driver_name, fst.performed_at, fst.activity, fst.created_at, fst.trip
+             FROM public.fuel_sale_transfers fst
+             LEFT JOIN public.fuel_lots fl ON fl.id = fst.lot_id
+            WHERE (fst.from_unit_id=$1 OR ($3 IS NOT NULL AND fst.from_unit_code=$3))
+          UNION ALL
+           SELECT tst.id, tst.lot_id, tst.from_unit_id, tst.from_unit_code,
+               tst.to_vehicle AS to_vehicle,
+               tst.transfer_volume_liters::int AS volume_liters,
+               fl.lot_code_created AS lot_code_initial,
+               tst.lot_code AS lot_code_by_transfer,
+               tst.driver_name, tst.performed_at AS performed_at, tst.activity, tst.performed_at AS created_at, tst.trip::int AS trip
+             FROM public.testing_self_transfers tst
+             LEFT JOIN public.fuel_lots fl ON fl.id = tst.lot_id
+            WHERE (tst.from_unit_id=$1 OR ($3 IS NOT NULL AND tst.from_unit_code=$3))
+         ) t
+         ORDER BY COALESCE(t.performed_at, t.created_at) DESC, t.id DESC
+         LIMIT $2`,
+      params
+    );
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Simple sales transfers list (no filtering) for display
+app.get('/api/fuel-ops/transfers/sales/list', requireAuth, async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit || '100', 10) || 100));
+    // Combine canonical sales with TESTING activities and LOADED lots for display purposes
+    const r = await pool.query(
+      `
+      SELECT * FROM (
+        SELECT id, from_unit_code, to_vehicle, performed_at, sale_date, sale_volume_liters, lot_code_after, driver_name, performed_by, activity, trip
+          FROM public.fuel_sale_transfers
+        UNION ALL
+        SELECT tst.id AS id,
+               COALESCE(su.unit_code, '') AS from_unit_code,
+               tst.to_vehicle AS to_vehicle,
+               tst.performed_at AS performed_at,
+               tst.sale_date AS sale_date,
+               tst.transfer_volume_liters AS sale_volume_liters,
+               tst.lot_code AS lot_code_after,
+               tst.driver_name AS driver_name,
+               tst.performed_by AS performed_by,
+               tst.activity AS activity,
+               tst.trip::int AS trip
+          FROM public.testing_self_transfers tst
+          LEFT JOIN public.storage_units su ON su.id = tst.from_unit_id
+        UNION ALL
+        SELECT fl.id AS id,
+               COALESCE(fl.tanker_code, '') AS from_unit_code,
+               NULL::text AS to_vehicle,
+               COALESCE(fl.load_time, fl.created_at) AS performed_at,
+               COALESCE((fl.load_time::date), (fl.created_at::date)) AS sale_date,
+               fl.loaded_liters AS sale_volume_liters,
+               fl.lot_code_created AS lot_code_after,
+               NULL::text AS driver_name,
+               NULL::text AS performed_by,
+               'LOADED'::text AS activity,
+               NULL::int AS trip
+          FROM public.fuel_lots fl
+          JOIN public.storage_units su ON su.id = fl.unit_id
+      ) t
+      ORDER BY COALESCE(t.sale_date, (t.performed_at::date)) DESC, t.id DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Simple list of internal transfers (no complex filters) for display purposes
+app.get('/api/fuel-ops/transfers/internal/list', requireAuth, async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit || '100', 10) || 100));
+    const r = await pool.query(
+      `SELECT id,
+              from_unit_code,
+              to_unit_code,
+              transfer_date,
+              transfer_time,
+              transfer_volume,
+              from_lot_code_change,
+              to_lot_code_change,
+              transfer_to_empty,
+              driver_name,
+              performed_by,
+              activity
+         FROM public.fuel_internal_transfers
+        ORDER BY transfer_date DESC, transfer_time DESC, id DESC
+        LIMIT $1`,
+      [limit]
+    );
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Edit an internal transfer record (volume and performed time only)
+app.patch('/api/fuel-ops/transfers/internal/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  const { transfer_volume_liters, transfer_volume, performed_time } = req.body || {};
+    const existingQ = await pool.query(`SELECT * FROM public.fuel_internal_transfers WHERE id=$1`, [id]);
+    if (!existingQ.rows.length) return res.status(404).json({ error: 'not found' });
+    const existing = existingQ.rows[0];
+    let vol = existing.transfer_volume || existing.transfer_volume_liters;
+    const volInput = transfer_volume != null ? transfer_volume : transfer_volume_liters;
+    if (volInput != null) {
+      const vNum = Number(volInput);
+      if (!Number.isFinite(vNum) || vNum <= 0) return res.status(400).json({ error: 'transfer_volume_liters invalid' });
+      vol = vNum;
+    }
+    let newTime = null;
+    if (performed_time) {
+      const t = String(performed_time).trim();
+      const [hh, mm] = t.split(':');
+      if (hh != null && mm != null) {
+        newTime = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:00`;
+      }
+    }
+    const upd = await pool.query(`
+      UPDATE public.fuel_internal_transfers
+         SET transfer_volume=$2,
+             transfer_time=COALESCE($3::time, transfer_time),
+             updated_at=NOW()
+       WHERE id=$1
+       RETURNING *
+    `, [id, vol, newTime]);
+    res.json(upd.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Edit a testing_self_transfers record (allow editing volume and performed_at/time)
+app.patch('/api/fuel-ops/transfers/testing/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const { transfer_volume_liters, transfer_volume, performed_time, sale_date } = req.body || {};
+    const existingQ = await pool.query(`SELECT * FROM public.testing_self_transfers WHERE id=$1`, [id]);
+    if (!existingQ.rows.length) return res.status(404).json({ error: 'not found' });
+    const existing = existingQ.rows[0];
+    const parts = [];
+    const vals = [];
+    let idx = 1;
+    if (transfer_volume != null) { parts.push(`transfer_volume_liters=$${idx++}`); vals.push(parseInt(transfer_volume,10)); }
+    else if (transfer_volume_liters != null) { parts.push(`transfer_volume_liters=$${idx++}`); vals.push(parseInt(transfer_volume_liters,10)); }
+    // Time edit (HH:mm). Determine date base: provided sale_date -> provided, else existing.sale_date -> existing.performed_at date -> today
+    if (performed_time != null) {
+      const hhmm = String(performed_time).trim();
+      if (/^\d{2}:\d{2}$/.test(hhmm)) {
+        const baseDate = sale_date ? isoDateOnly(sale_date)
+          : (existing.sale_date ? isoDateOnly(existing.sale_date) : (existing.performed_at ? isoDateOnly(existing.performed_at) : isoDateOnly(new Date())));
+        if (baseDate) {
+          parts.push(`performed_at=$${idx++}`);
+          vals.push(`${baseDate} ${hhmm}:00`);
+        }
+      }
+    }
+    if (sale_date != null && performed_time == null) {
+      // allow updating sale_date alone (date portion of performed_at)
+      const baseDate = isoDateOnly(sale_date);
+      if (baseDate) {
+        // derive hh:mm from existing.performed_at if present, else default to 00:00
+        const curDate = existing.performed_at ? isoDateOnly(existing.performed_at) : baseDate;
+        const timePart = existing.performed_at ? String(existing.performed_at).slice(11,19) : '00:00:00';
+        parts.push(`performed_at=$${idx++}`);
+        vals.push(`${baseDate} ${timePart}`);
+        parts.push(`sale_date=$${idx++}`);
+        vals.push(baseDate);
+      }
+    }
+    if (!parts.length) return res.status(400).json({ error: 'no fields to update' });
+    parts.push(`updated_at=NOW()`);
+    vals.push(id);
+    const q = await pool.query(`UPDATE public.testing_self_transfers SET ${parts.join(', ')} WHERE id=$${idx} RETURNING *`, vals);
+    if (!q.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(q.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete a testing_self_transfers record
+app.delete('/api/fuel-ops/transfers/testing/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const del = await pool.query(`DELETE FROM public.testing_self_transfers WHERE id=$1 RETURNING *`, [id]);
+    if (!del.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ deleted: true, row: del.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Consolidated per-day operations for a truck (sales, transfers in/out, loads, totals, remaining liters)
+app.get('/api/fuel-ops/ops/day', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStrRaw = req.query.date || new Date();
+    const dateStr = isoDateOnly(dateStrRaw);
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!dateStr) return res.status(400).json({ error: 'invalid date' });
+
+    // Helper queries to compute aggregate inbound/outbound usage for remaining liters
+    async function getInboundAddedLiters(lotId) {
+      const q = await pool.query(
+        `SELECT COALESCE(SUM(transfer_volume),0) AS added
+           FROM public.fuel_internal_transfers
+          WHERE to_lot_id=$1`, [lotId]
+      );
+      return Number(q.rows[0]?.added || 0);
+    }
+    async function getOutboundUsedLiters(lotId) {
+      const sales = await pool.query(`SELECT COALESCE(SUM(sale_volume_liters),0) AS s FROM public.fuel_sale_transfers WHERE lot_id=$1`, [lotId]);
+  const xfers = await pool.query(`SELECT COALESCE(SUM(transfer_volume),0) AS t FROM public.fuel_internal_transfers WHERE from_lot_id=$1`, [lotId]);
+      return Number(sales.rows[0]?.s || 0) + Number(xfers.rows[0]?.t || 0);
+    }
+
+    // Current in-stock lot for truck (most recent)
+    const lotQ = await pool.query(`SELECT * FROM public.fuel_lots WHERE unit_id=$1 AND stock_status='INSTOCK' ORDER BY created_at DESC, id DESC LIMIT 1`, [truckId]);
+    let lotInfo = null; let remainingLiters = null;
+    if (lotQ.rows.length) {
+      const lot = lotQ.rows[0];
+      const inbound = await getInboundAddedLiters(lot.id);
+      const outbound = await getOutboundUsedLiters(lot.id);
+      remainingLiters = Math.max(0, Number(lot.loaded_liters) + inbound - outbound);
+      // Clamp remaining to unit capacity if defined to avoid showing > capacity in UI
+      try {
+        const su = await pool.query(`SELECT capacity_liters FROM public.storage_units WHERE id=$1`, [truckId]);
+        const cap = Number(su.rows[0] && su.rows[0].capacity_liters ? su.rows[0].capacity_liters : 0);
+        if (cap > 0 && Number.isFinite(remainingLiters)) {
+          remainingLiters = Math.min(remainingLiters, cap);
+        }
+      } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[ops/day clamp warn]', e.message); }
+      lotInfo = {
+        id: lot.id,
+        lot_code_initial: lot.lot_code_created,
+        loaded_liters: lot.loaded_liters,
+        used_liters: lot.used_liters,
+        inbound_adds_liters: inbound,
+        outbound_used_liters: outbound,
+        remaining_liters: remainingLiters
+      };
+    }
+
+    // Day-filtered operations
+    const salesQ = await pool.query(
+      `SELECT id, from_unit_id, from_unit_code, to_vehicle, sale_volume_liters, lot_code_after, driver_name, performed_at, sale_date, activity
+         FROM public.fuel_sale_transfers
+        WHERE from_unit_id=$1 AND COALESCE(sale_date, performed_at::date) = $2::date
+        ORDER BY COALESCE(performed_at, sale_date) ASC, id ASC`,
+      [truckId, dateStr]
+    );
+    const transfersOutQ = await pool.query(
+      `SELECT id, from_unit_id, from_unit_code, to_unit_id, to_unit_code, transfer_volume, from_lot_code_change, to_lot_code_change, transfer_to_empty, driver_name, transfer_date, transfer_time, activity
+         FROM public.fuel_internal_transfers
+        WHERE from_unit_id=$1 AND transfer_date = $2::date
+        ORDER BY transfer_date ASC, transfer_time ASC, id ASC`,
+      [truckId, dateStr]
+    );
+    const transfersInQ = await pool.query(
+      `SELECT id, from_unit_id, from_unit_code, to_unit_id, to_unit_code, transfer_volume, from_lot_code_change, to_lot_code_change, transfer_to_empty, driver_name, transfer_date, transfer_time, activity
+         FROM public.fuel_internal_transfers
+        WHERE to_unit_id=$1 AND transfer_date = $2::date
+        ORDER BY transfer_date ASC, transfer_time ASC, id ASC`,
+      [truckId, dateStr]
+    );
+    const dateCol = await resolveFuelLotsDateCol();
+    const loadsQ = await pool.query(
+      `SELECT id, lot_code_created AS lot_code_initial, loaded_liters, ${dateCol} AS load_date, created_at, load_time, seq_index, load_type
+         FROM public.fuel_lots
+        WHERE unit_id=$1 AND ${dateCol} = $2::date
+        ORDER BY COALESCE(load_time, created_at) ASC, id ASC`,
+      [truckId, dateStr]
+    );
+    // Testing activities for the day (only from testing_self_transfers)
+    let testingQ = { rows: [] };
+    try {
+      testingQ = await pool.query(`
+        SELECT id, lot_id, from_unit_id, transfer_volume_liters AS testing_volume_liters, performed_at, activity
+          FROM public.testing_self_transfers
+         WHERE from_unit_id=$1 AND performed_at::date = $2::date
+         ORDER BY performed_at ASC, id ASC
+      `, [truckId, dateStr]);
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[ops/day testing warn]', e.message); }
+
+    // Totals for the day
+    const totals = {
+      sales_liters: salesQ.rows.reduce((a,r)=> a + Number(r.sale_volume_liters||0), 0),
+  transfers_out_liters: transfersOutQ.rows.reduce((a,r)=> a + Number(r.transfer_volume||0), 0),
+  transfers_in_liters: transfersInQ.rows.reduce((a,r)=> a + Number(r.transfer_volume||0), 0),
+      loaded_liters: loadsQ.rows.reduce((a,r)=> a + Number(r.loaded_liters||0), 0),
+      testing_liters: testingQ.rows.reduce((a,r)=> a + Number(r.testing_volume_liters||0), 0)
+    };
+
+    res.json({
+      truck_id: truckId,
+      date: dateStr,
+      lot: lotInfo,
+      remaining_liters: remainingLiters,
+      totals,
+      sales: salesQ.rows,
+      transfers_out: transfersOutQ.rows,
+      transfers_in: transfersInQ.rows,
+      loads: loadsQ.rows,
+      testing: testingQ.rows
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Consolidated per-trip operations filtered by opening/closing window
+app.get('/api/fuel-ops/ops/trip', requireAuth, async (req, res) => {
+  try {
+    const truckId = parseInt(req.query.truck_id, 10);
+    const dateStr = isoDateOnly(req.query.date || new Date());
+    const tripNo = parseInt(req.query.trip_no, 10);
+    if (!Number.isFinite(truckId) || truckId <= 0) return res.status(400).json({ error: 'truck_id required' });
+    if (!dateStr) return res.status(400).json({ error: 'invalid date' });
+    if (!Number.isFinite(tripNo) || tripNo <= 0) return res.status(400).json({ error: 'trip_no required' });
+
+    const tripQ = await pool.query(
+      `SELECT * FROM public.truck_dispenser_trips WHERE truck_id=$1 AND reading_date=$2 AND trip_no=$3`,
+      [truckId, dateStr, tripNo]
+    );
+    if (!tripQ.rows.length) return res.status(404).json({ error: 'trip not found' });
+    const trip = tripQ.rows[0];
+    const dateCol = await resolveFuelLotsDateCol();
+    // Next trip opening to bound upper window if closing_at is null
+    const nextQ = await pool.query(
+      `SELECT opening_at FROM public.truck_dispenser_trips
+        WHERE truck_id=$1 AND reading_date=$2 AND trip_no > $3
+        ORDER BY trip_no ASC
+        LIMIT 1`,
+      [truckId, dateStr, tripNo]
+    );
+    const defaultStart = `${dateStr} 00:00:00`;
+    const defaultEnd = `${dateStr} 23:59:59`;
+    // Guard: if opening is not saved yet, this trip has no window; return empty ops for clarity
+    if (!trip.opening_at) {
+      const loadsQ = await pool.query(
+        `SELECT id, lot_code_created AS lot_code_initial, loaded_liters, ${dateCol} AS load_date, created_at, load_time, seq_index, load_type
+           FROM public.fuel_lots
+          WHERE unit_id=$1 AND ${dateCol} = $2::date
+          ORDER BY COALESCE(load_time, created_at) ASC, id ASC`,
+        [truckId, dateStr]
+      );
+      return res.json({
+        truck_id: truckId,
+        date: dateStr,
+        trip_no: tripNo,
+        trip,
+        totals: { sales_liters: 0, transfers_out_liters: 0, transfers_in_liters: 0, loaded_liters: loadsQ.rows.reduce((a,r)=>a+Number(r.loaded_liters||0),0), testing_liters: 0 },
+        sales: [], transfers_out: [], transfers_in: [], loads: loadsQ.rows, testing: []
+      });
+    }
+    // IMPORTANT: Use DB timestamps as-is (no toISOString UTC conversion) to avoid timezone shifts.
+    const startSQL = toSqlLocalTs(trip.opening_at) || defaultStart;
+    const endSQL = trip.closing_at
+      ? (toSqlLocalTs(trip.closing_at) || defaultEnd)
+      : (nextQ.rows.length && nextQ.rows[0].opening_at
+          ? (toSqlLocalTs(nextQ.rows[0].opening_at) || defaultEnd)
+          : defaultEnd);
+
+    // Sales within window
+    const salesQ = await pool.query(
+      `SELECT id, from_unit_id, from_unit_code, to_vehicle, sale_volume_liters, lot_code_after, driver_name, performed_at, sale_date, activity
+         FROM public.fuel_sale_transfers
+        WHERE from_unit_id=$1 AND performed_at >= $2::timestamp AND performed_at < $3::timestamp
+        ORDER BY COALESCE(performed_at, sale_date) ASC, id ASC`,
+      [truckId, startSQL, endSQL]
+    );
+    const transfersOutQ = await pool.query(
+      `SELECT id, from_unit_id, from_unit_code, to_unit_id, to_unit_code, transfer_volume, from_lot_code_change, to_lot_code_change, transfer_to_empty, driver_name, transfer_date, transfer_time, activity
+         FROM public.fuel_internal_transfers
+        WHERE from_unit_id=$1 AND (transfer_date::timestamp + transfer_time) >= $2::timestamp AND (transfer_date::timestamp + transfer_time) < $3::timestamp
+        ORDER BY transfer_date ASC, transfer_time ASC, id ASC`,
+      [truckId, startSQL, endSQL]
+    );
+    const transfersInQ = await pool.query(
+      `SELECT id, from_unit_id, from_unit_code, to_unit_id, to_unit_code, transfer_volume, from_lot_code_change, to_lot_code_change, transfer_to_empty, driver_name, transfer_date, transfer_time, activity
+         FROM public.fuel_internal_transfers
+        WHERE to_unit_id=$1 AND (transfer_date::timestamp + transfer_time) >= $2::timestamp AND (transfer_date::timestamp + transfer_time) < $3::timestamp
+        ORDER BY transfer_date ASC, transfer_time ASC, id ASC`,
+      [truckId, startSQL, endSQL]
+    );
+    // Testing within trip window (performed_at between start and end). Only from testing_self_transfers.
+    let testingQ = { rows: [] };
+    try {
+      testingQ = await pool.query(`
+        SELECT id, lot_id, from_unit_id, transfer_volume_liters AS testing_volume_liters, performed_at, activity
+          FROM public.testing_self_transfers
+         WHERE from_unit_id=$1 AND performed_at >= $2::timestamp AND performed_at < $3::timestamp
+         ORDER BY performed_at ASC, id ASC
+      `, [truckId, startSQL, endSQL]);
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[ops/trip testing warn]', e.message); }
+    // loads are day-level; keep separate for UI reuse
+    const loadsQ = await pool.query(
+      `SELECT id, lot_code_created AS lot_code_initial, loaded_liters, ${dateCol} AS load_date, created_at, load_time, seq_index, load_type
+         FROM public.fuel_lots
+        WHERE unit_id=$1 AND ${dateCol} = $2::date
+        ORDER BY COALESCE(load_time, created_at) ASC, id ASC`,
+      [truckId, dateStr]
+    );
+
+    // Compute current in-stock lot and remaining liters (similar to ops/day) so UI can show remaining while in trip-mode
+    async function getInboundAddedLiters(lotId) {
+      const q = await pool.query(
+        `SELECT COALESCE(SUM(transfer_volume),0) AS added
+           FROM public.fuel_internal_transfers
+          WHERE to_lot_id=$1`, [lotId]
+      );
+      return Number(q.rows[0]?.added || 0);
+    }
+    async function getOutboundUsedLiters(lotId) {
+      const sales = await pool.query(`SELECT COALESCE(SUM(sale_volume_liters),0) AS s FROM public.fuel_sale_transfers WHERE lot_id=$1`, [lotId]);
+      const xfers = await pool.query(`SELECT COALESCE(SUM(transfer_volume),0) AS t FROM public.fuel_internal_transfers WHERE from_lot_id=$1`, [lotId]);
+      return Number(sales.rows[0]?.s || 0) + Number(xfers.rows[0]?.t || 0);
+    }
+
+    // Determine current in-stock lots for the truck and compute aggregate remaining liters
+    const lotsQ = await pool.query(`SELECT * FROM public.fuel_lots WHERE unit_id=$1 AND stock_status='INSTOCK' ORDER BY created_at DESC, id DESC`, [truckId]);
+    let lotInfo = null; let remainingLiters = null;
+    if (lotsQ.rows.length) {
+      let total = 0;
+      for (const lot of lotsQ.rows) {
+        const inbound = await getInboundAddedLiters(lot.id);
+        const outbound = await getOutboundUsedLiters(lot.id);
+        const rem = Math.max(0, Number(lot.loaded_liters) + inbound - outbound);
+        total += rem;
+      }
+      remainingLiters = total;
+      // Clamp aggregate remaining to unit capacity if available (fetch cap once)
+      let cap = 0;
+      try {
+        const su = await pool.query(`SELECT capacity_liters FROM public.storage_units WHERE id=$1`, [truckId]);
+        cap = Number(su.rows[0] && su.rows[0].capacity_liters ? su.rows[0].capacity_liters : 0);
+        if (cap > 0 && Number.isFinite(remainingLiters)) {
+          remainingLiters = Math.min(remainingLiters, cap);
+        }
+      } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[ops/trip clamp warn]', e.message); }
+      // expose the latest lot for display purposes
+      const latest = lotsQ.rows[0];
+      const latestInbound = await getInboundAddedLiters(latest.id);
+      const latestOutbound = await getOutboundUsedLiters(latest.id);
+      let latestRemaining = Math.max(0, Number(latest.loaded_liters) + latestInbound - latestOutbound);
+      if (cap > 0 && Number.isFinite(latestRemaining)) latestRemaining = Math.min(latestRemaining, cap);
+      lotInfo = {
+        id: latest.id,
+        lot_code_initial: latest.lot_code_created,
+        loaded_liters: latest.loaded_liters,
+        used_liters: latest.used_liters,
+        inbound_adds_liters: latestInbound,
+        outbound_used_liters: latestOutbound,
+        remaining_liters: latestRemaining
+      };
+    }
+
+    const totals = {
+      sales_liters: salesQ.rows.reduce((a,r)=> a + Number(r.sale_volume_liters||0), 0),
+  transfers_out_liters: transfersOutQ.rows.reduce((a,r)=> a + Number(r.transfer_volume||0), 0),
+  transfers_in_liters: transfersInQ.rows.reduce((a,r)=> a + Number(r.transfer_volume||0), 0),
+      loaded_liters: loadsQ.rows.reduce((a,r)=> a + Number(r.loaded_liters||0), 0),
+      testing_liters: testingQ.rows.reduce((a,r)=> a + Number(r.testing_volume_liters||0), 0)
+    };
+
+    res.json({
+      truck_id: truckId,
+      date: dateStr,
+      trip_no: tripNo,
+      trip,
+      totals,
+      lot: lotInfo,
+      remaining_liters: remainingLiters,
+      sales: salesQ.rows,
+      transfers_out: transfersOutQ.rows,
+      transfers_in: transfersInQ.rows,
+      loads: loadsQ.rows,
+      testing: testingQ.rows
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Edit/Delete endpoints for transfers (minimal fields; remaining liters computed from sums, so no counter updates here)
+app.delete('/api/fuel-ops/transfers/sales/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const del = await pool.query(`DELETE FROM public.fuel_sale_transfers WHERE id=$1 RETURNING *`, [id]);
+    if (!del.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ deleted: true, row: del.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/fuel-ops/transfers/sales/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const { sale_volume_liters, to_vehicle, sale_date, performed_time } = req.body || {};
+    // Load existing row to derive base date for performed_at time override
+    const existingQ = await pool.query(`SELECT id, performed_at, sale_date FROM public.fuel_sale_transfers WHERE id=$1`, [id]);
+    if (!existingQ.rows.length) return res.status(404).json({ error: 'not found' });
+    const existing = existingQ.rows[0];
+    const parts = [];
+    const vals = [];
+    let idx = 1;
+    if (sale_volume_liters != null) { parts.push(`sale_volume_liters=$${idx++}`); vals.push(parseInt(sale_volume_liters,10)); }
+    if (to_vehicle != null) { parts.push(`to_vehicle=$${idx++}`); vals.push(String(to_vehicle)); }
+    if (sale_date != null) { parts.push(`sale_date=$${idx++}`); vals.push(isoDateOnly(sale_date)); }
+    // Time edit (HH:mm) excluding loads; patch performed_at preserving/deriving date
+    if (performed_time != null) {
+      const hhmm = String(performed_time).trim();
+      if (/^\d{2}:\d{2}$/.test(hhmm)) {
+        // Determine date base preference: provided sale_date > existing.sale_date > existing.performed_at date part > CURRENT_DATE
+        const baseDate = sale_date ? isoDateOnly(sale_date)
+          : (existing.sale_date ? isoDateOnly(existing.sale_date) : (existing.performed_at ? isoDateOnly(existing.performed_at) : isoDateOnly(new Date())));
+        if (baseDate) {
+          parts.push(`performed_at=$${idx++}`);
+          vals.push(`${baseDate} ${hhmm}:00`);
+        }
+      }
+    }
+    if (!parts.length) return res.status(400).json({ error: 'no fields to update' });
+    parts.push(`updated_at=NOW()`);
+    vals.push(id);
+    const q = await pool.query(`UPDATE public.fuel_sale_transfers SET ${parts.join(', ')} WHERE id=$${idx} RETURNING *`, vals);
+    if (!q.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(q.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/fuel-ops/transfers/internal/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const del = await pool.query(`DELETE FROM public.fuel_internal_transfers WHERE id=$1 RETURNING *`, [id]);
+    if (!del.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json({ deleted: true, row: del.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/fuel-ops/transfers/internal/:id', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  const { transfer_volume_liters, transfer_volume, performed_time, transfer_date } = req.body || {};
+    // Load existing row for base date context
+  const existingQ = await pool.query(`SELECT id, transfer_date, transfer_time FROM public.fuel_internal_transfers WHERE id=$1`, [id]);
+    if (!existingQ.rows.length) return res.status(404).json({ error: 'not found' });
+    const existing = existingQ.rows[0];
+    const parts = [];
+    const vals = [];
+    let idx = 1;
+  if (transfer_volume != null) { parts.push(`transfer_volume=$${idx++}`); vals.push(parseInt(transfer_volume,10)); }
+  else if (transfer_volume_liters != null) { parts.push(`transfer_volume=$${idx++}`); vals.push(parseInt(transfer_volume_liters,10)); }
+    if (transfer_date != null) { parts.push(`transfer_date=$${idx++}`); vals.push(isoDateOnly(transfer_date)); }
+    if (performed_time != null) {
+      const hhmm = String(performed_time).trim();
+      if (/^\d{2}:\d{2}$/.test(hhmm)) {
+        parts.push(`transfer_time=$${idx++}`);
+        vals.push(`${hhmm}:00`);
+      }
+    }
+    if (!parts.length) return res.status(400).json({ error: 'no fields to update' });
+    parts.push(`updated_at=NOW()`);
+    vals.push(id);
+    const q = await pool.query(`UPDATE public.fuel_internal_transfers SET ${parts.join(', ')} WHERE id=$${idx} RETURNING *`, vals);
+    if (!q.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(q.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Full update of an internal transfer, including activity, date/time, from/to units, volume, and driver
+// Recomputes lot pointers and lot statuses to remain consistent with append-only sums logic
+app.put('/api/fuel-ops/transfers/internal/:id/full', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+    const { activity, from_unit_id, to_unit_id, volume_liters, driver_id, transfer_date, performed_time } = req.body || {};
+    const act = String(activity || '').toUpperCase();
+    if (!new Set(['TANKER_TO_TANKER','TANKER_TO_DATUM']).has(act)) return res.status(400).json({ error: 'invalid activity' });
+    const fromId = parseInt(from_unit_id, 10);
+    const toId = parseInt(to_unit_id, 10);
+    const vol = parseInt(volume_liters, 10);
+    if (!Number.isFinite(fromId) || fromId <= 0) return res.status(400).json({ error: 'from_unit_id required' });
+    if (!Number.isFinite(toId) || toId <= 0) return res.status(400).json({ error: 'to_unit_id required' });
+    if (!Number.isFinite(vol) || vol <= 0) return res.status(400).json({ error: 'volume_liters must be > 0' });
+
+    await client.query('BEGIN');
+    const existingQ = await client.query(`SELECT * FROM public.fuel_internal_transfers WHERE id=$1 FOR UPDATE`, [id]);
+    if (!existingQ.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not found' }); }
+    const existing = existingQ.rows[0];
+
+    // Resolve driver (optional)
+    let drow = null;
+    if (driver_id != null) {
+      const dr = await client.query(`SELECT id, name, driver_id FROM public.drivers WHERE id=$1`, [parseInt(driver_id,10)]);
+      drow = dr.rows[0] || null;
+    }
+
+    // Determine date-only and timestamp
+    const dateOnly = transfer_date ? isoDateOnly(transfer_date) : (existing.transfer_date ? isoDateOnly(existing.transfer_date) : isoDateOnly(new Date()));
+    const hhmm = (performed_time || '').trim();
+    const tsSql = (/^\d{2}:\d{2}$/.test(hhmm) && dateOnly) ? `${dateOnly} ${hhmm}:00` : (dateOnly ? `${dateOnly} 00:00:00` : null);
+
+    // Helper: inbound added (exclude seeding) for a lot
+    async function getInboundAddedLiters(c, lotId) {
+      const q = await c.query(
+        `SELECT COALESCE(SUM(fit.transfer_volume),0) AS added
+           FROM public.fuel_internal_transfers fit
+           JOIN public.fuel_lots fl ON fl.id = fit.to_lot_id
+          WHERE fit.to_lot_id=$1
+            AND NOT (
+              fit.transfer_to_empty = TRUE
+                   OR (fit.to_lot_code_change = fl.lot_code_created AND fit.transfer_volume = fl.loaded_liters)
+            )`,
+        [lotId]
+      );
+      return Number(q.rows[0]?.added || 0);
+    }
+    // Helper: outbound used (sales + internal transfers) for a lot
+    async function getOutboundUsedLiters(c, lotId) {
+      const sales = await c.query(`SELECT COALESCE(SUM(sale_volume_liters),0) AS s FROM public.fuel_sale_transfers WHERE lot_id=$1`, [lotId]);
+  const xfers = await c.query(`SELECT COALESCE(SUM(transfer_volume),0) AS t FROM public.fuel_internal_transfers WHERE from_lot_id=$1`, [lotId]);
+      return Number(sales.rows[0]?.s || 0) + Number(xfers.rows[0]?.t || 0);
+    }
+
+    // Resolve unit codes and lots
+    const fromUnit = await client.query(`SELECT id, unit_code, unit_type, capacity_liters FROM public.storage_units WHERE id=$1`, [fromId]);
+    const toUnit = await client.query(`SELECT id, unit_code, unit_type, capacity_liters FROM public.storage_units WHERE id=$1`, [toId]);
+    if (!fromUnit.rows.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'invalid from_unit_id' }); }
+    if (!toUnit.rows.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'invalid to_unit_id' }); }
+    const fromCode = fromUnit.rows[0].unit_code;
+    const toCode = toUnit.rows[0].unit_code;
+
+    // Find in-stock lots for from/to; if to has none, create EMPTY_TRANSFER lot seeded with this transfer volume
+    const lotFromQ = await client.query(`SELECT * FROM public.fuel_lots WHERE unit_id=$1 AND stock_status='INSTOCK' ORDER BY created_at DESC, id DESC LIMIT 1`, [fromId]);
+    if (!lotFromQ.rows.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'No in-stock lot for source unit' }); }
+    const lotFrom = lotFromQ.rows[0];
+
+  let lotToQ = await client.query(`SELECT * FROM public.fuel_lots WHERE unit_id=$1 AND stock_status='INSTOCK' ORDER BY created_at DESC, id DESC LIMIT 1`, [toId]);
+    let createdNewDestLot = false;
+    if (!lotToQ.rows.length) {
+      const tRow = toUnit.rows[0];
+      if (tRow && (tRow.unit_type === 'DATUM' || tRow.unit_type === 'TRUCK')) {
+        // capacity guard
+        const cap = Number(tRow.capacity_liters || 0);
+        if (cap > 0 && vol > cap) { await client.query('ROLLBACK'); return res.status(400).json({ error: `destination capacity exceeded: would be ${vol}/${cap}` }); }
+        const dateCol = await resolveFuelLotsDateCol();
+        const created = await client.query(`
+          WITH seq AS (
+            SELECT COALESCE(MAX(seq_index),0)+1 AS next
+              FROM public.fuel_lots
+             WHERE unit_id=$1 AND ${dateCol} = CURRENT_DATE
+          )
+          INSERT INTO public.fuel_lots (
+            unit_id, tanker_code, tanker_capacity, ${dateCol}, seq_index, seq_letters,
+            loaded_liters, lot_code_created, stock_status, used_liters, updated_at, load_type
+          )
+          SELECT $1, $2, $3, CURRENT_DATE, s.next, public.seq_index_to_letters(s.next),
+                 $4, public.gen_lot_code($2, CURRENT_DATE, s.next, $4), 'INSTOCK', 0, NOW(), 'EMPTY_TRANSFER'
+            FROM seq s
+            RETURNING *
+        `, [toId, toCode, toUnit.rows[0].capacity_liters, vol]);
+        lotToQ = created; createdNewDestLot = true;
+      }
+    }
+    if (!lotToQ.rows.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'No in-stock lot for destination unit' }); }
+    const lotTo = lotToQ.rows[0];
+
+    // Capacity guard for destination with current net
+    const destCap = Number(toUnit.rows[0].capacity_liters || 0);
+    if (destCap > 0) {
+      const toAddedBefore = createdNewDestLot ? 0 : await getInboundAddedLiters(client, lotTo.id);
+      const toUsedBefore = createdNewDestLot ? 0 : await getOutboundUsedLiters(client, lotTo.id);
+      const toCurrentNet = (createdNewDestLot ? 0 : (Number(lotTo.loaded_liters) + toAddedBefore - toUsedBefore));
+      const toNetAfter = toCurrentNet + vol;
+      if (toNetAfter > destCap) { await client.query('ROLLBACK'); return res.status(400).json({ error: `destination capacity exceeded: would be ${toNetAfter}/${destCap}` }); }
+    }
+
+    // Update transfer row core fields first (lot pointers, units, volume, activity, driver, timestamps, date)
+   const upd1 = await client.query(`
+    UPDATE public.fuel_internal_transfers
+      SET from_lot_id=$2, to_lot_id=$3,
+         from_unit_id=$4, to_unit_id=$5,
+         from_unit_code=$6, to_unit_code=$7,
+         transfer_volume=$8,
+         activity=$9,
+         driver_name=$10,
+         transfer_time=COALESCE($11::time, transfer_time),
+         transfer_date=COALESCE($12::date, transfer_date),
+         updated_at=NOW()
+     WHERE id=$1
+     RETURNING *
+   `, [id, lotFrom.id, lotTo.id, fromId, toId, fromCode, toCode, vol, act, drow ? drow.name : null, (tsSql ? hhmm : null), dateOnly]);
+    if (!upd1.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not found after update' }); }
+
+    // Recompute used/inbound to build after codes and adjust lot stock and used
+    const fromAddedCum = await getInboundAddedLiters(client, lotFrom.id);
+    const fromUsedNow = await getOutboundUsedLiters(client, lotFrom.id);
+    const fromSuffix = `-${fromUsedNow}` + (fromAddedCum > 0 ? `+(${fromAddedCum})` : '');
+  const fromLotCodeAfter = `${lotFrom.lot_code_created}${fromSuffix}`;
+
+    const toAddedAfter = createdNewDestLot ? 0 : await getInboundAddedLiters(client, lotTo.id);
+    const toUsedOut = createdNewDestLot ? 0 : await getOutboundUsedLiters(client, lotTo.id);
+    const toSuffix = createdNewDestLot ? '' : (`-${Number(lotTo.used_liters || 0)}` + (toAddedAfter > 0 ? `+(${toAddedAfter})` : ''));
+  const toLotCodeAfter = `${lotTo.lot_code_created}${toSuffix}`;
+
+  await client.query(`UPDATE public.fuel_internal_transfers SET from_lot_code_change=$2, to_lot_code_change=$3 WHERE id=$1`, [id, fromLotCodeAfter, toLotCodeAfter]);
+
+    // Ensure destination lot reflects the actual purchase time when it represents an EMPTY_TRANSFER seed.
+    // Case 1: Lot got created in this update (createdNewDestLot) and we have a performed_time -> set load_time.
+    // Case 2: Lot was created earlier without time and user edited performed_time later -> also set load_time
+    //         as long as the destination lot is an EMPTY_TRANSFER lot.
+    try {
+      if (tsSql) {
+        const shouldStampLoadTime = createdNewDestLot || (lotTo && String(lotTo.load_type).toUpperCase() === 'EMPTY_TRANSFER');
+        if (shouldStampLoadTime) {
+          await client.query(`UPDATE public.fuel_lots SET load_time=$1::timestamp WHERE id=$2`, [tsSql, lotTo.id]);
+        }
+      }
+    } catch (e) { if (!process.env.SUPPRESS_DB_LOG) console.warn('[warn] full update set load_time failed', e.message); }
+
+    // Update from lot used_liters and stock status
+    const fromNetRemaining = (Number(lotFrom.loaded_liters) + fromAddedCum) - fromUsedNow;
+    const fromStock = fromNetRemaining <= 0 ? 'SOLD' : 'INSTOCK';
+    await client.query(`UPDATE public.fuel_lots SET used_liters=$2, stock_status=$3, updated_at=NOW() WHERE id=$1`, [lotFrom.id, fromUsedNow, fromStock]);
+
+    // Update to lot stock status based on net remaining
+    const toNetRemaining = (Number(lotTo.loaded_liters) + (createdNewDestLot ? 0 : toAddedAfter)) - Number(lotTo.used_liters || 0);
+    const toStock = toNetRemaining <= 0 ? 'SOLD' : 'INSTOCK';
+    await client.query(`UPDATE public.fuel_lots SET stock_status=$2, updated_at=NOW() WHERE id=$1`, [lotTo.id, toStock]);
+
+    await client.query('COMMIT');
+    const finalQ = await pool.query(`SELECT * FROM public.fuel_internal_transfers WHERE id=$1`, [id]);
+    res.json(finalQ.rows[0]);
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// dispenser_readings table removed — use meter snapshots instead
+app.post('/api/fuel-ops/readings/dispenser', requireAuth, async (req, res) => {
+  res.status(410).json({ error: 'dispenser_readings removed; use /api/fuel-ops/meter-snapshots to record dispenser meter readings' });
+});
+app.get('/api/fuel-ops/readings/dispenser', requireAuth, async (req, res) => {
+  res.status(410).json({ error: 'dispenser_readings removed; use /api/fuel-ops/meter-snapshots to list dispenser meter snapshots' });
+});
+
+// truck_odometer_readings table removed — use daily odometer rollups or other odometer endpoints
+app.post('/api/fuel-ops/readings/odometer', requireAuth, async (req, res) => {
+  res.status(410).json({ error: 'truck_odometer_readings removed; use /api/fuel-ops/day/odometer for daily odometer records' });
+});
+app.get('/api/fuel-ops/readings/odometer', requireAuth, async (req, res) => {
+  res.status(410).json({ error: 'truck_odometer_readings removed; use /api/fuel-ops/day/odometer and /api/fuel-ops/day/odometer/list' });
+});
+
+// --- Reminders summaries (Overview and Assigned To) ---
+// Helper: format start-of-day for N days from now in server local time
+function localStartOfDayPlus(days = 0) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + (Number.isFinite(days) ? days : 0));
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} 00:00:00`;
+}
+
+// Helpers for this week/month boundaries (local-time)
+function localStartOfWeek() {
+  const d = new Date();
+  d.setHours(0,0,0,0);
+  // Monday as start of week
+  const day = d.getDay(); // 0=Sun ... 6=Sat
+  const offset = (day === 0 ? -6 : 1 - day);
+  d.setDate(d.getDate() + offset);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} 00:00:00`;
+}
+function localStartOfNextWeek() {
+  const d = new Date();
+  d.setHours(0,0,0,0);
+  const day = d.getDay();
+  const offsetToMonday = (day === 0 ? -6 : 1 - day);
+  d.setDate(d.getDate() + offsetToMonday + 7);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} 00:00:00`;
+}
+function localStartOfMonth() {
+  const d = new Date();
+  d.setHours(0,0,0,0);
+  d.setDate(1);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-01 00:00:00`;
+}
+function localStartOfNextMonth() {
+  const d = new Date();
+  d.setHours(0,0,0,0);
+  d.setDate(1);
+  d.setMonth(d.getMonth()+1);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-01 00:00:00`;
+}
+// Helpers aligning to client 'scopes' behavior
+function startOfWeekFor(date) {
+  const d = new Date(date.getTime());
+  d.setHours(0,0,0,0);
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const offset = (day === 0 ? -6 : 1 - day); // Monday start
+  d.setDate(d.getDate() + offset);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} 00:00:00`;
+}
+function addDaysSQL(sqlDateString, days) {
+  // postgres can add interval '1 day'
+  // We'll use SQL arithmetic via parameters instead; here we leave for clarity if needed.
+  return null;
+}
+
+// GET /api/reminders/summary/overview
+// Optional query: userId (OWNER/ADMIN only to view other users)
+// Buckets: delayed (PENDING before today), today, tomorrow
+app.get('/api/reminders/summary/overview', requireAuth, async (req, res) => {
+  try {
+    // Determine target user (self by default)
+    let targetUserId = req.user && req.user.sub;
+    const requestedUserId = req.query.userId ? String(req.query.userId) : null;
+    if (requestedUserId && req.user && (req.user.role === 'OWNER' || req.user.role === 'ADMIN')) {
+      // Validate selectable (exclude ADMIN)
+      const valid = await validateSelectableUserId(pool, requestedUserId);
+      if (!valid) return res.status(400).json({ error: 'Invalid userId' });
+      targetUserId = valid;
+    }
+    if (!targetUserId) return res.status(400).json({ error: 'Unable to resolve user' });
+
+    // Date buckets (local)
+    const startToday = localStartOfDayPlus(0);
+    const startTomorrow = localStartOfDayPlus(1);
+    const startDayAfter = localStartOfDayPlus(2);
+
+    // Scope: reminders created by or assigned to target user, or linked meetings created/assigned to target user
+    const params = [targetUserId, targetUserId, targetUserId, startToday, startTomorrow, startDayAfter];
+    const idents = [req.user.email, req.user.username, req.user.full_name].filter(v => v && String(v).trim().length);
+    let legacyCreated = '';
+    let legacyAssigned = '';
+    let legacyMeetings = '';
+    if (idents.length) {
+      const base = params.length;
+      params.push(...idents);
+      const ph = idents.map((_, i) => `$${base + i + 1}`).join(',');
+      legacyCreated = ` OR r.created_by IN (${ph})`;
+      const base2 = params.length;
+      params.push(...idents);
+      const ph2 = idents.map((_, i) => `$${base2 + i + 1}`).join(',');
+      legacyAssigned = ` OR r.assigned_to IN (${ph2})`;
+      // meetings legacy
+      const base3 = params.length;
+      params.push(...idents);
+      const ph3 = idents.map((_, i) => `$${base3 + i + 1}`).join(',');
+      const base4 = params.length;
+      params.push(...idents);
+      const ph4 = idents.map((_, i) => `$${base4 + i + 1}`).join(',');
+      legacyMeetings = ` OR r.meeting_id IN (SELECT id FROM meetings WHERE assigned_to IN (${ph3}) OR created_by IN (${ph4}))`;
+    }
+
+    const scope = `(
+      r.created_by_user_id = $1
+      OR r.assigned_to_user_id = $2
+      OR r.meeting_id IN (
+           SELECT id FROM meetings WHERE assigned_to_user_id = $3 OR created_by_user_id = $3
+        )
+      ${legacyCreated}
+      ${legacyAssigned}
+      ${legacyMeetings}
+    )`;
+
+    const sql = `
+      WITH base AS (
+        SELECT r.type, r.status,
+               CASE
+                 WHEN r.status = 'PENDING' AND r.due_ts < $4 THEN 'DELAYED'
+                 WHEN r.due_ts >= $4 AND r.due_ts < $5 THEN 'TODAY'
+                 WHEN r.due_ts >= $5 AND r.due_ts < $6 THEN 'TOMORROW'
+                 ELSE NULL
+               END AS bucket
+          FROM reminders r
+         WHERE ${scope}
+           AND r.type IN ('CALL','EMAIL')
+           AND (
+                (r.status = 'PENDING' AND r.due_ts < $4)
+                OR (r.due_ts >= $4 AND r.due_ts < $6)
+           )
+      )
+      SELECT bucket, type, status, COUNT(*)::int AS count
+        FROM base
+       WHERE bucket IS NOT NULL
+       GROUP BY bucket, type, status
+    `;
+    const r = await pool.query(sql, params);
+    const buckets = { delayed: {}, today: {}, tomorrow: {} };
+    for (const row of r.rows) {
+      const b = String(row.bucket || '').toLowerCase();
+      if (!buckets[b]) buckets[b] = {};
+      if (!buckets[b][row.type]) buckets[b][row.type] = {};
+      buckets[b][row.type][row.status] = Number(row.count) || 0;
+    }
+    return res.json({ buckets, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/reminders/summary/assigned
+// Query: assignedToUserId (optional), createdBy=self (optional flag; if present and not 'self', ignored)
+app.get('/api/reminders/summary/assigned', requireAuth, async (req, res) => {
+  try {
+    // Date buckets (local)
+    const startToday = localStartOfDayPlus(0);
+    const startTomorrow = localStartOfDayPlus(1);
+    const startDayAfter = localStartOfDayPlus(2);
+
+  const params = [startToday, startTomorrow, startDayAfter];
+
+    // Scope: by default, only reminders created by self (aligns with Assigned To page semantics)
+    // Determine whether to enforce createdBy=self:
+    // - Always enforce for EMPLOYEE
+    // - For OWNER/ADMIN: enforce only when createdBy=self is explicitly requested
+    const forceCreatedBySelf = (req.user && req.user.role === 'EMPLOYEE') || (String(req.query.createdBy || '').toLowerCase() === 'self');
+    let creatorScope = '';
+    if (forceCreatedBySelf) {
+      if (req.user && req.user.sub) {
+        params.push(req.user.sub);
+        const base = params.length;
+        creatorScope = `(r.created_by_user_id = $${base}`;
+        const idents = [req.user.email, req.user.username, req.user.full_name].filter(v => v && String(v).trim().length);
+        if (idents.length) {
+          const base2 = params.length;
+          params.push(...idents);
+          const ph = idents.map((_, i) => `$${base2 + i + 1}`).join(',');
+          creatorScope += ` OR r.created_by IN (${ph})`;
+        }
+        creatorScope += ')';
+      } else {
+        return res.status(400).json({ error: 'Unauthorized' });
+      }
+    }
+
+    // Optional filter: assignedToUserId
+    const assignedToUserId = req.query.assignedToUserId ? String(req.query.assignedToUserId) : null;
+    let assigneeFilter = '';
+    if (assignedToUserId) {
+      if (req.user && (req.user.role === 'OWNER' || req.user.role === 'ADMIN')) {
+        const valid = await validateSelectableUserId(pool, assignedToUserId);
+        if (!valid) return res.status(400).json({ error: 'Invalid assignedToUserId' });
+        params.push(valid);
+        const base = params.length;
+        assigneeFilter = ` AND (r.assigned_to_user_id = $${base}`;
+        const ur = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [valid]);
+        const parts = ur.rows.length ? [ur.rows[0].email, ur.rows[0].username, ur.rows[0].full_name].filter(v => v && String(v).trim().length) : [];
+        if (parts.length) {
+          const base2 = params.length;
+          params.push(...parts);
+          const ph = parts.map((_, i) => `$${base2 + i + 1}`).join(',');
+          assigneeFilter += ` OR r.assigned_to IN (${ph})`;
+        }
+        assigneeFilter += ')';
+      } else if (req.user && req.user.role === 'EMPLOYEE') {
+        // EMPLOYEE can only filter to self or if createdBy=self is enforced (already enforced above)
+        const allowedUserId = (String(assignedToUserId) === String(req.user.sub)) ? req.user.sub : await validateSelectableUserId(pool, assignedToUserId);
+        if (!allowedUserId) return res.status(403).json({ error: 'Forbidden assignedToUserId' });
+        params.push(allowedUserId);
+        const base = params.length;
+        assigneeFilter = ` AND (r.assigned_to_user_id = $${base}`;
+        const ur = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [allowedUserId]);
+        const parts = ur.rows.length ? [ur.rows[0].email, ur.rows[0].username, ur.rows[0].full_name].filter(v => v && String(v).trim().length) : [];
+        if (parts.length) {
+          const base2 = params.length;
+          params.push(...parts);
+          const ph = parts.map((_, i) => `$${base2 + i + 1}`).join(',');
+          assigneeFilter += ` OR r.assigned_to IN (${ph})`;
+        }
+        assigneeFilter += ')';
+      }
+    }
+
+    const sql = `
+      WITH scoped AS (
+        SELECT r.type, r.status,
+               CASE
+                 WHEN r.status = 'PENDING' AND r.due_ts < $1 THEN 'DELAYED'
+                 WHEN r.due_ts >= $1 AND r.due_ts < $2 THEN 'TODAY'
+                 WHEN r.due_ts >= $2 AND r.due_ts < $3 THEN 'TOMORROW'
+                 ELSE NULL
+               END AS bucket
+          FROM reminders r
+      WHERE ${(creatorScope ? creatorScope + '\n           ' : '')}${assigneeFilter}
+           AND r.type IN ('CALL','EMAIL')
+           AND (
+                (r.status = 'PENDING' AND r.due_ts < $1)
+                OR (r.due_ts >= $1 AND r.due_ts < $3)
+           )
+      )
+      SELECT bucket, type, status, COUNT(*)::int AS count
+        FROM scoped
+       WHERE bucket IS NOT NULL
+       GROUP BY bucket, type, status
+    `;
+    const r = await pool.query(sql, params);
+    const buckets = { delayed: {}, today: {}, tomorrow: {} };
+    for (const row of r.rows) {
+      const b = String(row.bucket || '').toLowerCase();
+      if (!buckets[b]) buckets[b] = {};
+      if (!buckets[b][row.type]) buckets[b][row.type] = {};
+      buckets[b][row.type][row.status] = Number(row.count) || 0;
+    }
+    return res.json({ buckets, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Extended overview summary for My Overview tab
+// Returns counts for: total, today, tomorrow, this week, this month
+// Each group includes: overdue (delayed PENDING), pending (non-delayed), done, sent, failed
+app.get('/api/reminders/summary/overview-extended', requireAuth, async (req, res) => {
+  try {
+    // Determine target user (self by default; OWNER/ADMIN may pass userId)
+    let targetUserId = req.user && req.user.sub;
+    const requestedUserId = req.query.userId ? String(req.query.userId) : null;
+    if (requestedUserId && req.user && (req.user.role === 'OWNER' || req.user.role === 'ADMIN')) {
+      const valid = await validateSelectableUserId(pool, requestedUserId);
+      if (!valid) return res.status(400).json({ error: 'Invalid userId' });
+      targetUserId = valid;
+    }
+    if (!targetUserId) return res.status(400).json({ error: 'Unable to resolve user' });
+
+  // Dates
+  const nowTs = formatLocalSQL(new Date());
+  const startToday = localStartOfDayPlus(0);
+    const startTomorrow = localStartOfDayPlus(1);
+    const startDayAfter = localStartOfDayPlus(2);
+  // Week/Month windows must match client scopes:
+  // - week: week that contains tomorrow (Mon..Sun)
+  // - month: the 3 weeks immediately after that week (rolling window)
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(0,0,0,0);
+  const startWeek = startOfWeekFor(tomorrow); // Monday 00:00:00 of week containing tomorrow (as local SQL string)
+  // Compute windows as concrete timestamps to avoid inline SQL arithmetic/quoting issues
+  const startWeekDate = toLocalDate(startWeek);
+  const plusDays = (d, n) => { const x = new Date(d.getTime()); x.setDate(x.getDate() + n); return x; };
+  const startNextWeekTs = formatLocalSQL(plusDays(startWeekDate, 7)); // exclusive upper bound for week
+  const startMonthTs = startNextWeekTs;                               // month starts right after that week
+  const startNextMonthTs = formatLocalSQL(plusDays(startWeekDate, 28)); // week start + 28 days
+
+    // Scope conditions as in overview endpoint
+  // Note: startNextWeek/startMonth/startNextMonth are SQL expressions; we'll inline them into the query
+  const params = [targetUserId, targetUserId, targetUserId, nowTs, startToday, startTomorrow, startDayAfter, startWeek, startNextWeekTs, startMonthTs, startNextMonthTs];
+    const idents = [req.user.email, req.user.username, req.user.full_name].filter(v => v && String(v).trim().length);
+    let legacyCreated = '';
+    let legacyAssigned = '';
+    let legacyMeetings = '';
+    if (idents.length) {
+      const base = params.length;
+      params.push(...idents);
+      const ph = idents.map((_, i) => `$${base + i + 1}`).join(',');
+      legacyCreated = ` OR r.created_by IN (${ph})`;
+      const base2 = params.length;
+      params.push(...idents);
+      const ph2 = idents.map((_, i) => `$${base2 + i + 1}`).join(',');
+      legacyAssigned = ` OR r.assigned_to IN (${ph2})`;
+      const base3 = params.length;
+      params.push(...idents);
+      const ph3 = idents.map((_, i) => `$${base3 + i + 1}`).join(',');
+      const base4 = params.length;
+      params.push(...idents);
+      const ph4 = idents.map((_, i) => `$${base4 + i + 1}`).join(',');
+      legacyMeetings = ` OR r.meeting_id IN (SELECT id FROM meetings WHERE assigned_to IN (${ph3}) OR created_by IN (${ph4}))`;
+    }
+    const scope = `(
+      r.created_by_user_id = $1
+      OR r.assigned_to_user_id = $2
+      OR r.meeting_id IN (SELECT id FROM meetings WHERE assigned_to_user_id = $3 OR created_by_user_id = $3)
+      ${legacyCreated}
+      ${legacyAssigned}
+      ${legacyMeetings}
+    )`;
+    const sql = `
+      WITH scoped AS (
+        SELECT r.status, r.due_ts
+          FROM reminders r
+         WHERE ${scope}
+           AND r.type IN ('CALL','EMAIL')
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts < LOCALTIMESTAMP)::int AS overdue_global,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= LOCALTIMESTAMP)::int AS pending_total,
+        COUNT(*) FILTER (WHERE status='DONE')::int AS done_total,
+        COUNT(*) FILTER (WHERE status='SENT')::int AS sent_total,
+        COUNT(*) FILTER (WHERE status='FAILED')::int AS failed_total,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $5 AND due_ts < $6 AND due_ts >= LOCALTIMESTAMP)::int AS pending_today,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $5 AND due_ts < $6)::int AS done_today,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $5 AND due_ts < $6)::int AS sent_today,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $5 AND due_ts < $6)::int AS failed_today,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $6 AND due_ts < $7)::int AS pending_tomorrow,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $6 AND due_ts < $7)::int AS done_tomorrow,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $6 AND due_ts < $7)::int AS sent_tomorrow,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $6 AND due_ts < $7)::int AS failed_tomorrow,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $8 AND due_ts < $9)::int AS pending_week,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $8 AND due_ts < $9)::int AS done_week,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $8 AND due_ts < $9)::int AS sent_week,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $8 AND due_ts < $9)::int AS failed_week,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $10 AND due_ts < $11)::int AS pending_month,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $10 AND due_ts < $11)::int AS done_month,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $10 AND due_ts < $11)::int AS sent_month,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $10 AND due_ts < $11)::int AS failed_month
+      FROM scoped
+    `;
+    const rows = await pool.query(sql, params);
+    const row = rows.rows[0] || {};
+    const overdueGlobal = Number(row.overdue_global || 0);
+    const result = {
+      total: {
+        overdue: overdueGlobal,
+        pending: Number(row.pending_total || 0),
+        done: Number(row.done_total || 0),
+        sent: Number(row.sent_total || 0),
+        failed: Number(row.failed_total || 0)
+      },
+      today: {
+        overdue: overdueGlobal,
+        pending: Number(row.pending_today || 0),
+        done: Number(row.done_today || 0),
+        sent: Number(row.sent_today || 0),
+        failed: Number(row.failed_today || 0)
+      },
+      tomorrow: {
+        overdue: 0,
+        pending: Number(row.pending_tomorrow || 0),
+        done: Number(row.done_tomorrow || 0),
+        sent: Number(row.sent_tomorrow || 0),
+        failed: Number(row.failed_tomorrow || 0)
+      },
+      week: {
+        overdue: 0,
+        pending: Number(row.pending_week || 0),
+        done: Number(row.done_week || 0),
+        sent: Number(row.sent_week || 0),
+        failed: Number(row.failed_week || 0)
+      },
+      month: {
+        overdue: 0,
+        pending: Number(row.pending_month || 0),
+        done: Number(row.done_month || 0),
+        sent: Number(row.sent_month || 0),
+        failed: Number(row.failed_month || 0)
+      },
+      generatedAt: new Date().toISOString()
+    };
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Extended summary for Employee Overview (OWNER/ADMIN aggregate or per-user)
+// Query params: optional userId (OWNER/ADMIN may select any selectable user; EMPLOYEE only self)
+// Returns counts for: total, today, tomorrow, this week, this month
+// Each group includes: overdue (delayed PENDING), pending (non-delayed), done, sent, failed
+app.get('/api/reminders/summary/employee-extended', requireAuth, async (req, res) => {
+  try {
+    const role = (req.user && req.user.role) || 'EMPLOYEE';
+    const requestedUserId = req.query.userId ? String(req.query.userId) : null;
+
+    // Resolve per-user scope (if any), with role-aware guard
+    let scopeSql = '';
+    const params = [];
+    if (requestedUserId) {
+      if (role === 'OWNER' || role === 'ADMIN') {
+        const valid = await validateSelectableUserId(pool, requestedUserId);
+        if (!valid) return res.status(400).json({ error: 'Invalid userId' });
+        // param order: [created_by_user_id, assigned_to_user_id, meeting.assigned_to_user_id, meeting.created_by_user_id, ... legacy idents]
+        params.push(valid, valid, valid, valid);
+        // Also support legacy string columns
+        const ur = await pool.query('SELECT email, username, full_name FROM public.users WHERE id=$1', [valid]);
+        const idents = ur.rows.length ? [ur.rows[0].email, ur.rows[0].username, ur.rows[0].full_name].filter(v => v && String(v).trim().length) : [];
+        let legacyCreated = '';
+        let legacyAssigned = '';
+        let legacyMeetings = '';
+        if (idents.length) {
+          const base = params.length;
+          params.push(...idents);
+          const ph = idents.map((_, i) => `$${base + i + 1}`).join(',');
+          legacyCreated = ` OR r.created_by IN (${ph})`;
+          const base2 = params.length;
+          params.push(...idents);
+          const ph2 = idents.map((_, i) => `$${base2 + i + 1}`).join(',');
+          legacyAssigned = ` OR r.assigned_to IN (${ph2})`;
+          const base3 = params.length;
+          params.push(...idents);
+          const ph3 = idents.map((_, i) => `$${base3 + i + 1}`).join(',');
+          const base4 = params.length;
+          params.push(...idents);
+          const ph4 = idents.map((_, i) => `$${base4 + i + 1}`).join(',');
+          legacyMeetings = ` OR r.meeting_id IN (SELECT id FROM meetings WHERE assigned_to IN (${ph3}) OR created_by IN (${ph4}))`;
+        }
+        scopeSql = `(
+          r.created_by_user_id = $1
+          OR r.assigned_to_user_id = $2
+          OR r.meeting_id IN (SELECT id FROM meetings WHERE assigned_to_user_id = $3 OR created_by_user_id = $4)
+          ${legacyCreated}
+          ${legacyAssigned}
+          ${legacyMeetings}
+        )`;
+      } else if (role === 'EMPLOYEE') {
+        // Employees may only query themselves
+        const selfId = req.user && req.user.sub;
+        if (!selfId || String(requestedUserId) !== String(selfId)) return res.status(403).json({ error: 'Forbidden' });
+        params.push(selfId, selfId, selfId, selfId);
+        const ids = [req.user.email, req.user.username, req.user.full_name].filter(v => v && String(v).trim().length);
+        let legacyCreated = '';
+        let legacyAssigned = '';
+        let legacyMeetings = '';
+        if (ids.length) {
+          const base = params.length;
+          params.push(...ids);
+          const ph = ids.map((_, i) => `$${base + i + 1}`).join(',');
+          legacyCreated = ` OR r.created_by IN (${ph})`;
+          const base2 = params.length;
+          params.push(...ids);
+          const ph2 = ids.map((_, i) => `$${base2 + i + 1}`).join(',');
+          legacyAssigned = ` OR r.assigned_to IN (${ph2})`;
+          const base3 = params.length;
+          params.push(...ids);
+          const ph3 = ids.map((_, i) => `$${base3 + i + 1}`).join(',');
+          const base4 = params.length;
+          params.push(...ids);
+          const ph4 = ids.map((_, i) => `$${base4 + i + 1}`).join(',');
+          legacyMeetings = ` OR r.meeting_id IN (SELECT id FROM meetings WHERE assigned_to IN (${ph3}) OR created_by IN (${ph4}))`;
+        }
+        scopeSql = `(
+          r.created_by_user_id = $1
+          OR r.assigned_to_user_id = $2
+          OR r.meeting_id IN (SELECT id FROM meetings WHERE assigned_to_user_id = $3 OR created_by_user_id = $4)
+          ${legacyCreated}
+          ${legacyAssigned}
+          ${legacyMeetings}
+        )`;
+      }
+    } else {
+      // Everyone aggregate: OWNER/ADMIN only; EMPLOYEE forbidden
+      if (!(role === 'OWNER' || role === 'ADMIN')) return res.status(403).json({ error: 'Forbidden' });
+      scopeSql = ''; // no per-user restriction
+    }
+
+  // Dates
+  const nowTs = formatLocalSQL(new Date());
+  const startToday = localStartOfDayPlus(0);
+    const startTomorrow = localStartOfDayPlus(1);
+    const startDayAfter = localStartOfDayPlus(2);
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0,0,0,0);
+    const startWeek = startOfWeekFor(tomorrow);
+    const startWeekDate = toLocalDate(startWeek);
+    const plusDays = (d, n) => { const x = new Date(d.getTime()); x.setDate(x.getDate() + n); return x; };
+    const startNextWeekTs = formatLocalSQL(plusDays(startWeekDate, 7));
+    const startMonthTs = startNextWeekTs;
+    const startNextMonthTs = formatLocalSQL(plusDays(startWeekDate, 28));
+
+  const dateParams = [nowTs, startToday, startTomorrow, startDayAfter, startWeek, startNextWeekTs, startMonthTs, startNextMonthTs];
+    const allParams = params.concat(dateParams);
+
+    const whereScope = scopeSql ? `${scopeSql} AND` : '';
+    const sql = `
+      WITH scoped AS (
+        SELECT r.status, r.due_ts
+          FROM reminders r
+         WHERE ${whereScope}
+               r.type IN ('CALL','EMAIL')
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts < LOCALTIMESTAMP)::int AS overdue_global,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= LOCALTIMESTAMP)::int AS pending_total,
+        COUNT(*) FILTER (WHERE status='DONE')::int AS done_total,
+        COUNT(*) FILTER (WHERE status='SENT')::int AS sent_total,
+        COUNT(*) FILTER (WHERE status='FAILED')::int AS failed_total,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $${params.length + 2} AND due_ts < $${params.length + 3} AND due_ts >= LOCALTIMESTAMP)::int AS pending_today,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $${params.length + 2} AND due_ts < $${params.length + 3})::int AS done_today,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $${params.length + 2} AND due_ts < $${params.length + 3})::int AS sent_today,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $${params.length + 2} AND due_ts < $${params.length + 3})::int AS failed_today,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $${params.length + 3} AND due_ts < $${params.length + 4})::int AS pending_tomorrow,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $${params.length + 3} AND due_ts < $${params.length + 4})::int AS done_tomorrow,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $${params.length + 3} AND due_ts < $${params.length + 4})::int AS sent_tomorrow,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $${params.length + 3} AND due_ts < $${params.length + 4})::int AS failed_tomorrow,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $${params.length + 5} AND due_ts < $${params.length + 6})::int AS pending_week,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $${params.length + 5} AND due_ts < $${params.length + 6})::int AS done_week,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $${params.length + 5} AND due_ts < $${params.length + 6})::int AS sent_week,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $${params.length + 5} AND due_ts < $${params.length + 6})::int AS failed_week,
+        COUNT(*) FILTER (WHERE status='PENDING' AND due_ts >= $${params.length + 7} AND due_ts < $${params.length + 8})::int AS pending_month,
+        COUNT(*) FILTER (WHERE status='DONE' AND due_ts >= $${params.length + 7} AND due_ts < $${params.length + 8})::int AS done_month,
+        COUNT(*) FILTER (WHERE status='SENT' AND due_ts >= $${params.length + 7} AND due_ts < $${params.length + 8})::int AS sent_month,
+        COUNT(*) FILTER (WHERE status='FAILED' AND due_ts >= $${params.length + 7} AND due_ts < $${params.length + 8})::int AS failed_month
+      FROM scoped
+    `;
+    const q = await pool.query(sql, allParams);
+    const row = q.rows[0] || {};
+    const overdueGlobal = Number(row.overdue_global || 0);
+    const result = {
+      total: { overdue: overdueGlobal, pending: Number(row.pending_total || 0), done: Number(row.done_total || 0), sent: Number(row.sent_total || 0), failed: Number(row.failed_total || 0) },
+      today: { overdue: overdueGlobal, pending: Number(row.pending_today || 0), done: Number(row.done_today || 0), sent: Number(row.sent_today || 0), failed: Number(row.failed_today || 0) },
+      tomorrow: { overdue: 0, pending: Number(row.pending_tomorrow || 0), done: Number(row.done_tomorrow || 0), sent: Number(row.sent_tomorrow || 0), failed: Number(row.failed_tomorrow || 0) },
+      week: { overdue: 0, pending: Number(row.pending_week || 0), done: Number(row.done_week || 0), sent: Number(row.sent_week || 0), failed: Number(row.failed_week || 0) },
+      month: { overdue: 0, pending: Number(row.pending_month || 0), done: Number(row.done_month || 0), sent: Number(row.sent_month || 0), failed: Number(row.failed_month || 0) },
+      generatedAt: new Date().toISOString()
+    };
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Diagnostics: email configuration status (no secrets)
 app.get('/api/diagnostics/email-config', (req, res) => {
   try {
@@ -430,9 +3436,50 @@ function isValidDateTimeString(s) {
   if (!s || typeof s !== 'string') return false;
   // Accept YYYY-MM-DD HH:mm[:ss] or ISO-like
   if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(s)) return true;
+  // Accept DD-MM-YYYY HH:mm[:ss]
+  if (/^\d{2}-\d{2}-\d{4}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$/.test(s)) return true;
   // Accept a parseable ISO as a fallback
   const d = new Date(s);
   return !isNaN(d.getTime());
+}
+// Format a Date as local-time SQL timestamp (YYYY-MM-DD HH:mm:ss) without TZ conversion
+function fmtSqlTsLocal(d) {
+  const x = new Date(d);
+  const pad = n => String(n).padStart(2, '0');
+  return `${x.getFullYear()}-${pad(x.getMonth()+1)}-${pad(x.getDate())} ${pad(x.getHours())}:${pad(x.getMinutes())}:${pad(x.getSeconds())}`;
+}
+// Coerce various user-entered date/time strings into a local SQL timestamp string.
+// Rules:
+// - If input is 'YYYY-MM-DD HH:mm[:ss]' or 'YYYY-MM-DDTHH:mm[:ss]', keep the local wall clock time as-entered.
+// - If input is 'DD-MM-YYYY HH:mm[:ss]' (or with 'T'), convert to YYYY-MM-DD and keep local time.
+// - If input contains explicit TZ (Z/+hh:mm), parse and then format as local wall time.
+function coerceLocalSqlTimestamp(input) {
+  if (!input) return null;
+  let s = String(input).trim();
+  if (!s) return null;
+  // Normalize T to space for simple patterns
+  s = s.replace('T', ' ');
+  // DD-MM-YYYY [HH:mm[:ss]]
+  let m = s.match(/^(\d{2})-(\d{2})-(\d{4})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    const [, dd, mm, yyyy, HH='00', MM='00', SS='00'] = m;
+    return `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`;
+  }
+  // YYYY-MM-DD [HH:mm[:ss]] (no timezone) -> keep local wall time
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (m) {
+    const [, yyyy, mm, dd, HH, MM, SS='00'] = m;
+    return `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`;
+  }
+  // If string contains explicit timezone (Z or +hh:mm), parse and render in local
+  if (/Z|[+-]\d{2}:\d{2}$/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return fmtSqlTsLocal(d);
+  }
+  // Fallback: try Date parse and render as local
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return fmtSqlTsLocal(d);
+  return null;
 }
 async function validateSelectableUserId(db, userId) {
   if (!userId) return null;
@@ -1560,6 +4607,136 @@ function normalizeLocal(ts) {
   return formatLocalSQL(d);
 }
 
+// Feature flags
+const FEATURE_REMINDERS_AUDIT = /^(1|true|yes|on)$/i.test(String(process.env.FEATURE_REMINDERS_AUDIT || 'true'));
+
+// --- Meetings audit helpers (v2: JSONB diff + snapshot) ---
+function buildMeetingSnapshot(row) {
+  if (!row) return null;
+  return {
+    id: row.id || null,
+    customer_id: row.customer_id || null,
+    opportunity_id: row.opportunity_id || null,
+    contract_id: row.contract_id || null,
+    subject: row.subject || null,
+    starts_at: row.starts_at || row.when_ts || null,
+    when_ts: row.when_ts || null,
+    location: row.location || null,
+    person_name: row.person_name || null,
+    contact_phone: row.contact_phone || null,
+    notes: row.notes || null,
+    status: row.status || null,
+    assigned_to: row.assigned_to || null,
+    assigned_to_user_id: row.assigned_to_user_id || null,
+    created_by: row.created_by || null,
+    created_by_user_id: row.created_by_user_id || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+    completed_at: row.completed_at || null
+  };
+}
+
+// --- Reminders audit helpers (v2: JSONB diff + snapshot) ---
+function buildReminderSnapshot(row) {
+  if (!row) return null;
+  return {
+    id: row.id || null,
+    title: row.title || null,
+    due_ts: row.due_ts || row.when_ts || null,
+    notify_at: row.notify_at || null,
+    notes: row.notes || null,
+    status: row.status || null,
+    type: row.type || null,
+    receiver_email: row.receiver_email || row.recipient_email || null,
+    person_name: row.person_name || null,
+    phone: row.phone || null,
+    opportunity_id: row.opportunity_id || null,
+    meeting_id: row.meeting_id || null,
+    assigned_to: row.assigned_to || null,
+    assigned_to_user_id: row.assigned_to_user_id || null,
+    created_by: row.created_by || null,
+    created_by_user_id: row.created_by_user_id || null,
+    client_name: row.client_name || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null
+  };
+}
+function diffReminder(before, after) {
+  if (!before || !after) return null;
+  const keys = ['title','due_ts','notify_at','notes','status','type','receiver_email','person_name','phone','opportunity_id','meeting_id','assigned_to','assigned_to_user_id'];
+  const d = {};
+  for (const k of keys) {
+    const bv = before[k] instanceof Date ? before[k].toISOString() : before[k];
+    const av = after[k] instanceof Date ? after[k].toISOString() : after[k];
+    const bvs = bv === undefined ? null : bv;
+    const avs = av === undefined ? null : av;
+    if (String(bvs) !== String(avs)) {
+      d[k] = { from: bvs, to: avs };
+    }
+  }
+  return Object.keys(d).length ? d : null;
+}
+async function insertReminderAuditV2(client, action, beforeRow, afterRow, note, req) {
+  if (!FEATURE_REMINDERS_AUDIT) return;
+  try {
+    const reminderId = (afterRow && afterRow.id) || (beforeRow && beforeRow.id);
+    if (!reminderId) return;
+    const vr = await client.query('SELECT COALESCE(MAX(version),0)+1 AS v FROM reminders_audit_v2 WHERE reminder_id=$1', [String(reminderId)]);
+    const version = (vr.rows[0] && vr.rows[0].v) ? Number(vr.rows[0].v) : 1;
+    const actorUserId = req.user && req.user.sub ? req.user.sub : null;
+    const actor = getActor(req);
+    const diff = beforeRow && afterRow ? diffReminder(buildReminderSnapshot(beforeRow), buildReminderSnapshot(afterRow)) : null;
+    const snapshotObj = afterRow ? buildReminderSnapshot(afterRow) : (beforeRow ? buildReminderSnapshot(beforeRow) : null);
+    const diffStr = diff ? JSON.stringify(diff) : null;
+    const snapStr = snapshotObj ? JSON.stringify(snapshotObj) : null;
+    const reminderType = (afterRow && afterRow.type) || (beforeRow && beforeRow.type) || (snapshotObj && snapshotObj.type) || null;
+    await client.query(
+      `INSERT INTO reminders_audit_v2 (reminder_id, version, action, performed_by_user_id, performed_by, diff, snapshot, note, reminder_type)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9)`,
+      [String(reminderId), version, action, actorUserId, actor || null, diffStr, snapStr, note || null, reminderType]
+    );
+  } catch (e) {
+    console.warn('[reminders_audit_v2] insert failed:', e.message);
+  }
+}
+function diffMeeting(before, after) {
+  if (!before || !after) return null;
+  const keys = ['customer_id','opportunity_id','contract_id','subject','starts_at','when_ts','location','person_name','contact_phone','notes','status','assigned_to','assigned_to_user_id'];
+  const d = {};
+  for (const k of keys) {
+    const bv = before[k] instanceof Date ? before[k].toISOString() : before[k];
+    const av = after[k] instanceof Date ? after[k].toISOString() : after[k];
+    const bvs = bv === undefined ? null : bv;
+    const avs = av === undefined ? null : av;
+    if (String(bvs) !== String(avs)) {
+      d[k] = { from: bvs, to: avs };
+    }
+  }
+  return Object.keys(d).length ? d : null;
+}
+async function insertMeetingAuditV2(client, action, beforeRow, afterRow, note, req) {
+  try {
+    const meetingId = (afterRow && afterRow.id) || (beforeRow && beforeRow.id);
+    if (!meetingId) return;
+    const vr = await client.query('SELECT COALESCE(MAX(version),0)+1 AS v FROM meetings_audit_v2 WHERE meeting_id=$1', [meetingId]);
+    const version = (vr.rows[0] && vr.rows[0].v) ? Number(vr.rows[0].v) : 1;
+    const actorUserId = req.user && req.user.sub ? req.user.sub : null;
+    const actor = getActor(req);
+    const diff = beforeRow && afterRow ? diffMeeting(beforeRow, afterRow) : null;
+    const snapshotObj = afterRow ? buildMeetingSnapshot(afterRow) : (beforeRow ? buildMeetingSnapshot(beforeRow) : null);
+    const diffStr = diff ? JSON.stringify(diff) : null;
+    const snapStr = snapshotObj ? JSON.stringify(snapshotObj) : null;
+    await client.query(
+      `INSERT INTO meetings_audit_v2 (meeting_id, version, action, performed_by_user_id, performed_by, diff, snapshot, note)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8)`,
+      [meetingId, version, action, actorUserId, actor || null, diffStr, snapStr, note || null]
+    );
+  } catch (e) {
+    // best-effort; don't block main flow on audit failure
+    console.warn('[meetings_audit_v2] insert failed:', e.message);
+  }
+}
+
 // Helper: build a meeting DTO for email/template/ICS
 function buildMeetingDto({ id, subject, clientName, personName, startsAt, endsAt, location, meetingLink }) {
   const start = new Date(startsAt);
@@ -1750,12 +4927,18 @@ app.get('/api/meetings', requireAuth, async (req, res) => {
              ua.email AS assigned_to_email,
              uc.full_name AS created_by_full_name,
              uc.username AS created_by_username,
-             uc.email AS created_by_email
+             uc.email AS created_by_email,
+             COALESCE(mea.emails_sent_count, 0) AS emails_sent_count
       FROM meetings m
       LEFT JOIN customers c ON c.customer_id = m.customer_id
       LEFT JOIN opportunities o ON o.opportunity_id = m.opportunity_id
       LEFT JOIN public.users ua ON ua.id = m.assigned_to_user_id
       LEFT JOIN public.users uc ON uc.id = m.created_by_user_id
+      LEFT JOIN (
+        SELECT meeting_id, (COUNT(*) FILTER (WHERE status = 'SENT'))::int AS emails_sent_count
+          FROM meeting_email_audit
+         GROUP BY meeting_id
+      ) mea ON mea.meeting_id = m.id
       ${where}
       ${order}
       LIMIT ${s} OFFSET ${offset}
@@ -1773,7 +4956,7 @@ app.get('/api/meetings/:id/ics', async (req, res) => {
   try {
     const id = req.params.id;
     const r = await pool.query(`
-      SELECT m.id, m.subject, m.starts_at, m.location, m.person_name,
+      SELECT m.id, m.subject, m.starts_at, m.location, m.person_name, m.meeting_link,
              COALESCE(c.client_name, o.client_name) AS client_name
         FROM meetings m
         LEFT JOIN customers c ON c.customer_id = m.customer_id
@@ -1783,7 +4966,7 @@ app.get('/api/meetings/:id/ics', async (req, res) => {
     `, [id]);
     if (!r.rows.length) return res.status(404).send('Not found');
     const row = r.rows[0];
-    const dto = buildMeetingDto({ id: row.id, subject: row.subject, clientName: row.client_name, personName: row.person_name, startsAt: row.starts_at, endsAt: null, location: row.location });
+    const dto = buildMeetingDto({ id: row.id, subject: row.subject, clientName: row.client_name, personName: row.person_name, startsAt: row.starts_at, endsAt: null, location: row.location, meetingLink: row.meeting_link });
     const ics = await generateICS(dto);
     res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="meeting-${encodeURIComponent(id)}.ics"`);
@@ -1833,7 +5016,7 @@ app.get('/api/reminders/ics', async (req, res) => {
 
 // Create meeting with audit
 app.post('/api/meetings', requireAuth, async (req, res) => {
-  let { id, customer_id, opportunity_id, contract_id, subject, starts_at, when_ts, location, person_name, contact_phone, notes, status, assigned_to, assignedToUserId } = req.body || {};
+  let { id, customer_id, opportunity_id, contract_id, subject, starts_at, when_ts, location, person_name, contact_phone, notes, status, assigned_to, assignedToUserId, meeting_link, meetingLink } = req.body || {};
   subject = (subject || '').toString().trim();
   const start = normalizeTimestamp(starts_at || when_ts);
   // Allow meetings for leads: either customer_id OR opportunity_id must be present
@@ -1911,13 +5094,13 @@ app.post('/api/meetings', requireAuth, async (req, res) => {
     const ins = await client.query(
       `INSERT INTO meetings (
          id, customer_id, opportunity_id, contract_id, subject, starts_at, when_ts, location, person_name, contact_phone, notes, status,
-         assigned_to, assigned_to_user_id, created_by, created_by_user_id, created_at, updated_at)
+         assigned_to, assigned_to_user_id, meeting_link, created_by, created_by_user_id, created_at, updated_at)
        VALUES (
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-         $13,$14,$15,$16,NOW(),NOW()
+         $13,$14,$15,$16,$17,NOW(),NOW()
        ) RETURNING *`,
       [id, customer_id, opportunity_id || null, contract_id || null, subject, start, start, location || null, person_name, contact_phone, notes || null, st,
-       assignedLabel || null, assignedUserId || null, actor, actorUserId]
+       assignedLabel || null, assignedUserId || null, (meeting_link || meetingLink || null), actor, actorUserId]
     );
     const row = ins.rows[0];
     await client.query(
@@ -1925,6 +5108,7 @@ app.post('/api/meetings', requireAuth, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [row.id, 'CREATE', actor, null, row.subject, null, row.starts_at, null, row.status, null]
     );
+    await insertMeetingAuditV2(client, 'CREATE', null, row, null, req);
     await client.query('COMMIT');
     res.status(201).json(row);
   } catch (err) {
@@ -1939,7 +5123,7 @@ app.post('/api/meetings', requireAuth, async (req, res) => {
 // Update meeting with audit
 app.put('/api/meetings/:id', requireAuth, async (req, res) => {
   const id = req.params.id;
-  let { customer_id, opportunity_id, contract_id, subject, starts_at, when_ts, location, person_name, contact_phone, notes, status, assigned_to, assignedToUserId } = req.body || {};
+  let { customer_id, opportunity_id, contract_id, subject, starts_at, when_ts, location, person_name, contact_phone, notes, status, assigned_to, assignedToUserId, meeting_link, meetingLink } = req.body || {};
   const start = starts_at || when_ts ? normalizeTimestamp(starts_at || when_ts) : undefined;
   const client = await pool.connect();
   try {
@@ -1999,8 +5183,8 @@ app.put('/api/meetings/:id', requireAuth, async (req, res) => {
       }
     }
     const upd = await client.query(
-      `UPDATE meetings SET customer_id=$1, opportunity_id=$2, contract_id=$3, subject=$4, starts_at=$5, when_ts=$6, location=$7, person_name=$8, contact_phone=$9, notes=$10, status=$11, assigned_to=$12, assigned_to_user_id=$13, updated_at=NOW()
-       WHERE id=$14 RETURNING *`,
+      `UPDATE meetings SET customer_id=$1, opportunity_id=$2, contract_id=$3, subject=$4, starts_at=$5, when_ts=$6, location=$7, person_name=$8, contact_phone=$9, notes=$10, status=$11, assigned_to=$12, assigned_to_user_id=$13, meeting_link=$14, updated_at=NOW()
+       WHERE id=$15 RETURNING *`,
       [
         customer_id || cur.customer_id,
         newOpportunityId || cur.opportunity_id,
@@ -2015,6 +5199,7 @@ app.put('/api/meetings/:id', requireAuth, async (req, res) => {
         newStatus,
         assignedNorm,
         newAssignedUserId,
+        (meeting_link !== undefined ? (meeting_link || meetingLink || null) : cur.meeting_link),
         id
       ]
     );
@@ -2027,6 +5212,7 @@ app.put('/api/meetings/:id', requireAuth, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [row.id, 'UPDATE', actor, cur.subject, row.subject, cur.starts_at, row.starts_at, cur.status, row.status, outcomeNotes]
     );
+    await insertMeetingAuditV2(client, 'UPDATE', cur, row, outcomeNotes, req);
     await client.query('COMMIT');
     res.json(row);
   } catch (err) {
@@ -2065,6 +5251,7 @@ app.patch('/api/meetings/:id/complete', requireAuth, async (req, res) => {
       'INSERT INTO meetings_audit (meeting_id, action, performed_by, before_status, after_status, outcome_notes) VALUES ($1,$2,$3,$4,$5,$6)',
       [row.id, 'COMPLETE', performed_by || actor, cur.status, row.status, outcomeText || null]
     );
+    await insertMeetingAuditV2(client, 'COMPLETE', cur, row, outcomeText || null, req);
     await client.query('COMMIT');
     res.json(row);
   } catch (err) {
@@ -2102,6 +5289,7 @@ app.patch('/api/meetings/:id/cancel', requireAuth, async (req, res) => {
       'INSERT INTO meetings_audit (meeting_id, action, performed_by, before_status, after_status, outcome_notes) VALUES ($1,$2,$3,$4,$5,$6)',
       [row.id, 'CANCEL', performed_by || actor, cur.status, row.status, reason || null]
     );
+    await insertMeetingAuditV2(client, 'CANCEL', cur, row, reason || null, req);
     await client.query('COMMIT');
     res.json(row);
   } catch (err) {
@@ -2133,6 +5321,7 @@ app.delete('/api/meetings/:id', requireAuth, async (req, res) => {
     await client.query('DELETE FROM meetings WHERE id=$1', [id]);
   const actor = getActor(req);
   await client.query('INSERT INTO meetings_audit (meeting_id, action, performed_by, before_subject, before_starts_at, before_status, outcome_notes) VALUES ($1,$2,$3,$4,$5,$6,$7)', [cur.id, 'DELETE', actor, cur.subject, cur.starts_at, cur.status, null]);
+  await insertMeetingAuditV2(client, 'DELETE', cur, null, null, req);
     await client.query('COMMIT');
     res.json({ success: true });
   } catch (err) {
@@ -2327,6 +5516,28 @@ app.get('/api/reminders', requireAuth, async (req, res) => {
     }
     const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
     const order = (String(sort||'').toLowerCase() === 'due_ts_asc') ? 'ORDER BY r.due_ts ASC NULLS LAST' : 'ORDER BY r.due_ts DESC NULLS LAST';
+    const enableEmailAgg = (featureFlags && featureFlags.hasRemindersEmailAudit) || FEATURE_REMINDERS_AUDIT;
+    const enableCallAgg = (featureFlags && featureFlags.hasRemindersCallAudit) || FEATURE_REMINDERS_AUDIT;
+    const selectAgg = [
+      enableEmailAgg ? "COALESCE(ra.cnt,0)::int AS emails_sent_attempts" : null,
+      enableCallAgg ? "COALESCE(rc.cnt,0)::int AS calls_attempts" : null
+    ].filter(Boolean).length ? (', ' + [
+      enableEmailAgg ? "COALESCE(ra.cnt,0)::int AS emails_sent_attempts" : null,
+      enableCallAgg ? "COALESCE(rc.cnt,0)::int AS calls_attempts" : null
+    ].filter(Boolean).join(', ')) : '';
+    const joinAgg = [
+      enableEmailAgg ? `LEFT JOIN (
+        SELECT reminder_id, COUNT(*)::int AS cnt
+          FROM reminder_email_selected_audit
+         WHERE status = 'SENT'
+         GROUP BY reminder_id
+      ) ra ON ra.reminder_id = r.id` : '',
+      enableCallAgg ? `LEFT JOIN (
+        SELECT reminder_id, (COUNT(*) FILTER (WHERE status = 'COMPLETED'))::int AS cnt
+          FROM reminder_call_attempt_audit
+         GROUP BY reminder_id
+      ) rc ON rc.reminder_id = r.id` : ''
+    ].filter(Boolean).join('\n      ');
     const sql = `
       SELECT r.*,
              uc.full_name AS created_by_full_name,
@@ -2335,9 +5546,11 @@ app.get('/api/reminders', requireAuth, async (req, res) => {
              ua.full_name AS assigned_to_full_name,
              ua.username  AS assigned_to_username,
              ua.email     AS assigned_to_email
+             ${selectAgg}
       FROM reminders r
       LEFT JOIN public.users uc ON uc.id = r.created_by_user_id
       LEFT JOIN public.users ua ON ua.id = r.assigned_to_user_id
+      ${joinAgg}
       ${where}
       ${order}
       LIMIT ${s} OFFSET ${offset}
@@ -2477,6 +5690,8 @@ app.post('/api/reminders', requireAuth, async (req, res) => {
       'INSERT INTO reminders (id, title, due_ts, notes, status, type, notify_at, receiver_email, person_name, phone, opportunity_id, meeting_id, created_by, created_by_user_id, assigned_to, assigned_to_user_id, client_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *',
       [id, title, normalizeLocal(dueDate), notes || null, status, type, normalizeLocal(notifyAtDate), receiver_email, person_name || null, phone || null, opportunity_id || null, meeting_id || null, actor, actorUserId, assigneeLabel, assigneeUserId, clientName]
     );
+    // Audit (CREATE)
+    try { await insertReminderAuditV2(pool, 'CREATE', null, result.rows[0], null, req); } catch (e) { /* best-effort */ }
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
@@ -2493,7 +5708,7 @@ app.post('/api/email/preview/meeting', requireAuth, async (req, res) => {
     if (req.body && req.body.meetingId) {
       const id = String(req.body.meetingId);
       const r = await pool.query(`
-        SELECT m.id, m.subject, m.starts_at, m.location, m.person_name,
+        SELECT m.id, m.subject, m.starts_at, m.location, m.person_name, m.meeting_link,
                m.customer_id, m.opportunity_id, m.contract_id,
                COALESCE(c.client_name, o.client_name) AS client_name
           FROM meetings m
@@ -2504,7 +5719,7 @@ app.post('/api/email/preview/meeting', requireAuth, async (req, res) => {
       `, [id]);
       if (!r.rows.length) return res.status(404).json({ error: 'Meeting not found' });
   const row = r.rows[0];
-  meeting = buildMeetingDto({ id: row.id, subject: row.subject, clientName: row.client_name, personName: row.person_name, startsAt: row.starts_at, endsAt: null, location: row.location });
+  meeting = buildMeetingDto({ id: row.id, subject: row.subject, clientName: row.client_name, personName: row.person_name, startsAt: row.starts_at, endsAt: null, location: row.location, meetingLink: row.meeting_link });
       // Resolve client email from unified profile (prefers customer, then contract)
       try {
         const oppId = row.opportunity_id;
@@ -2522,7 +5737,7 @@ app.post('/api/email/preview/meeting', requireAuth, async (req, res) => {
       if (!b.title || !b.clientName || !b.startsAt) {
         return res.status(400).json({ error: 'title, clientName, and startsAt are required' });
       }
-      meeting = buildMeetingDto({ id: b.id || 'preview', subject: b.title, clientName: b.clientName, personName: b.personName, startsAt: b.startsAt, endsAt: b.endsAt, location: b.location, meetingLink: b.meetingLink });
+  meeting = buildMeetingDto({ id: b.id || 'preview', subject: b.title, clientName: b.clientName, personName: b.personName, startsAt: b.startsAt, endsAt: b.endsAt, location: b.location, meetingLink: (b.meetingLink || b.meeting_link) });
       try {
         // If opportunityId is provided, use it to lookup client email
         if (b.opportunityId) {
@@ -2563,7 +5778,7 @@ app.post('/api/email/preview/reminders', requireAuth, async (req, res) => {
     // Fetch selected reminders
     const ph = ids.map((_, i) => `$${i + 1}`).join(',');
     const r = await pool.query(
-      `SELECT id, title, type, status, due_ts, receiver_email, person_name, phone, opportunity_id, client_name,
+      `SELECT id, title, type, status, due_ts, receiver_email, person_name, phone, opportunity_id, client_name, notes,
               created_by, created_by_user_id, assigned_to, assigned_to_user_id, meeting_id
          FROM reminders
         WHERE id IN (${ph})`,
@@ -2669,7 +5884,7 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
       let dto;
       if (meetingId) {
         const r = await pool.query(`
-          SELECT m.id, m.subject, m.starts_at, m.location, m.person_name,
+          SELECT m.id, m.subject, m.starts_at, m.location, m.person_name, m.meeting_link,
                  COALESCE(c.client_name, o.client_name) AS client_name
             FROM meetings m
             LEFT JOIN customers c ON c.customer_id = m.customer_id
@@ -2679,10 +5894,10 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
         `, [String(meetingId)]);
         if (r.rows.length) {
           const row = r.rows[0];
-          dto = buildMeetingDto({ id: row.id, subject: row.subject, clientName: row.client_name, personName: row.person_name, startsAt: row.starts_at, endsAt: null, location: row.location });
+          dto = buildMeetingDto({ id: row.id, subject: row.subject, clientName: row.client_name, personName: row.person_name, startsAt: row.starts_at, endsAt: null, location: row.location, meetingLink: row.meeting_link });
         }
       } else {
-        dto = buildMeetingDto({ id: meeting.id || 'meeting', subject: meeting.title, clientName: meeting.clientName, personName: meeting.personName, startsAt: meeting.startsAt, endsAt: meeting.endsAt, location: meeting.location, meetingLink: meeting.meetingLink });
+        dto = buildMeetingDto({ id: meeting.id || 'meeting', subject: meeting.title, clientName: meeting.clientName, personName: meeting.personName, startsAt: meeting.startsAt, endsAt: meeting.endsAt, location: meeting.location, meetingLink: (meeting.meetingLink || meeting.meeting_link) });
       }
       if (dto) {
         try {
@@ -2695,7 +5910,12 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
     }
 
     // Optional multi-ICS for reminders selection
-    const rIds = Array.isArray(remindersIds) ? remindersIds.filter(Boolean).map(String) : [];
+  const rIds = Array.isArray(remindersIds) ? remindersIds.filter(Boolean).map(String) : [];
+  let reminderTypeById = null;
+  const allRecipients = Array.from(new Set([...(toList||[]), ...(ccList||[]), ...(bccList||[])]));
+  const sentCount = allRecipients.length;
+  const { randomUUID } = require('crypto');
+  const operationId = rIds.length ? (randomUUID ? randomUUID() : null) : null;
     if (rIds.length) {
       try {
         const ph = rIds.map((_, i) => `$${i + 1}`).join(',');
@@ -2705,6 +5925,10 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
             WHERE id IN (${ph})
             ORDER BY due_ts ASC NULLS LAST`, rIds);
         if (r.rows && r.rows.length) {
+          // Build a map of reminder_id -> reminder.type for audit enrichment
+          try {
+            reminderTypeById = new Map(r.rows.map(row => [String(row.id), row.type || null]));
+          } catch {}
           const ics = await generateICSMultiForReminders(r.rows);
           const today = new Date();
           const ymd = today.toISOString().slice(0,10).replace(/-/g,'');
@@ -2717,6 +5941,34 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
 
     try {
       const info = await sendEmail({ to: toList, cc: ccList, bcc: bccList, subject, html, attachments });
+      // Audit meeting email send if linked to a meeting
+      try {
+        if (meetingId) {
+          const actor = getActor(req);
+          const actorUserId = req.user && req.user.sub;
+          await pool.query(
+            `INSERT INTO meeting_email_audit (meeting_id, performed_by_user_id, performed_by, subject, to_recipients, cc_recipients, bcc_recipients, status, message_id, sent_count, recipients_detail)
+             VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,'SENT',$8,$9,$10::jsonb)`,
+            [String(meetingId), actorUserId || null, actor || null, subject || null, JSON.stringify(toList), JSON.stringify(ccList), JSON.stringify(bccList), info.messageId || null, sentCount, JSON.stringify(allRecipients.map(e => ({ email: e, status: 'SENT', messageId: info.messageId || null })))]
+          );
+        }
+      } catch (ae) { console.warn('[meeting_email_audit] insert failed:', ae.message); }
+      // Audit reminders Email Selected (single batch) — one row per reminder
+      try {
+        if (FEATURE_REMINDERS_AUDIT && rIds.length && operationId) {
+          const actor = getActor(req);
+          const actorUserId = req.user && req.user.sub;
+          const tasks = rIds.map(rid => {
+            const rtype = reminderTypeById && reminderTypeById.get(String(rid)) || null;
+            return pool.query(
+              `INSERT INTO reminder_email_selected_audit (operation_id, reminder_id, performed_by_user_id, performed_by, subject, to_recipients, cc_recipients, bcc_recipients, recipients_dedup, sent_count, status, message_id, reminder_type)
+               VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,'SENT',$11,$12)`,
+              [operationId, String(rid), actorUserId || null, actor || null, subject || null, JSON.stringify(toList), JSON.stringify(ccList), JSON.stringify(bccList), JSON.stringify(allRecipients), sentCount, info.messageId || null, rtype]
+            );
+          });
+          await Promise.allSettled(tasks);
+        }
+      } catch (ae) { console.warn('[reminder_email_selected_audit] insert failed:', ae.message); }
       return res.json({ ok: true, messageId: info.messageId });
     } catch (e) {
       // Log detailed error to server logs for diagnostics (avoids leaking secrets to clients)
@@ -2727,8 +5979,319 @@ app.post('/api/email/send', requireAuth, async (req, res) => {
       } catch {}
       // Provide a user-friendly error for missing SMTP config
       const msg = e && e.code === 'SMTP_CONFIG_MISSING' ? e.message : (e.message || 'Email send failed');
+      // Attempt to audit failure as well if tied to a meeting
+      try {
+        if (meetingId) {
+          const actor = getActor(req);
+          const actorUserId = req.user && req.user.sub;
+          await pool.query(
+            `INSERT INTO meeting_email_audit (meeting_id, performed_by_user_id, performed_by, subject, to_recipients, cc_recipients, bcc_recipients, status, error, sent_count, recipients_detail)
+             VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,'FAILED',$8,$9,$10::jsonb)`,
+            [String(meetingId), actorUserId || null, actor || null, subject || null, JSON.stringify(toList), JSON.stringify(ccList), JSON.stringify(bccList), String(msg), 0, JSON.stringify(allRecipients.map(em => ({ email: em, status: 'FAILED', error: String(msg) })))]
+          );
+        }
+      } catch (ae) { console.warn('[meeting_email_audit] insert failed:', ae.message); }
+      // Audit reminders Email Selected failure (batch)
+      try {
+        if (FEATURE_REMINDERS_AUDIT && rIds.length && operationId) {
+          const actor = getActor(req);
+          const actorUserId = req.user && req.user.sub;
+          const tasks = rIds.map(rid => {
+            const rtype = reminderTypeById && reminderTypeById.get(String(rid)) || null;
+            return pool.query(
+              `INSERT INTO reminder_email_selected_audit (operation_id, reminder_id, performed_by_user_id, performed_by, subject, to_recipients, cc_recipients, bcc_recipients, recipients_dedup, sent_count, status, error, reminder_type)
+               VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10,'FAILED',$11,$12)`,
+              [operationId, String(rid), actorUserId || null, actor || null, subject || null, JSON.stringify(toList), JSON.stringify(ccList), JSON.stringify(bccList), JSON.stringify(allRecipients), 0, String(msg), rtype]
+            );
+          });
+          await Promise.allSettled(tasks);
+        }
+      } catch (ae) { console.warn('[reminder_email_selected_audit] insert failed:', ae.message); }
       return res.status(500).json({ error: msg });
     }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Read meeting audits (v2) for a specific meeting
+app.get('/api/meetings/:id/audit-v2', requireAuth, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    // Visibility guard for EMPLOYEE
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const r = await pool.query('SELECT 1 FROM meetings WHERE id=$1 AND (assigned_to_user_id=$2 OR created_by_user_id=$2 OR assigned_to=$3 OR created_by=$3) LIMIT 1', [id, req.user.sub, actor]);
+      if (!r.rows.length) return res.status(403).json({ error: 'Forbidden' });
+    }
+    const rows = await pool.query('SELECT * FROM meetings_audit_v2 WHERE meeting_id=$1 ORDER BY version ASC', [id]);
+    res.json({ items: rows.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Read meeting email send audit for a specific meeting
+app.get('/api/meetings/:id/email-audit', requireAuth, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    // Visibility guard for EMPLOYEE
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const r = await pool.query('SELECT 1 FROM meetings WHERE id=$1 AND (assigned_to_user_id=$2 OR created_by_user_id=$2 OR assigned_to=$3 OR created_by=$3) LIMIT 1', [id, req.user.sub, actor]);
+      if (!r.rows.length) return res.status(403).json({ error: 'Forbidden' });
+    }
+    const rows = await pool.query('SELECT * FROM meeting_email_audit WHERE meeting_id=$1 ORDER BY performed_at DESC', [id]);
+    res.json({ items: rows.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// List all meetings audit v2 entries with optional filters (meetingId substring, action, date range)
+app.get('/api/meetings-audit-v2', requireAuth, async (req, res) => {
+  try {
+    let { meetingId, action, dateFrom, dateTo, page = 1, pageSize = 50 } = req.query || {};
+    const p = clampInt(page, 1, 100000, 1);
+    const s = clampInt(pageSize, 1, 500, 50);
+    const offset = (p - 1) * s;
+    const params = [];
+    const filters = [];
+    if (meetingId) {
+      params.push(`%${String(meetingId).trim()}%`);
+      filters.push(`a.meeting_id ILIKE $${params.length}`);
+    }
+    if (action) {
+      const list = String(action).split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+      if (list.length) {
+        const ph = list.map((_, i) => `$${params.length + i + 1}`).join(',');
+        params.push(...list);
+        filters.push(`a.action IN (${ph})`);
+      }
+    }
+    if (dateFrom && isValidDateTimeString(dateFrom)) { params.push(dateFrom); filters.push(`a.performed_at >= $${params.length}`); }
+    if (dateTo && isValidDateTimeString(dateTo)) { params.push(dateTo); filters.push(`a.performed_at <= $${params.length}`); }
+
+    // Visibility guard for EMPLOYEE: restrict to meetings they can see
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const uid = req.user.sub;
+      params.push(uid, uid, actor, actor);
+      const base = params.length;
+      filters.push(`(m.assigned_to_user_id = $${base-3} OR m.created_by_user_id = $${base-2} OR m.assigned_to = $${base-1} OR m.created_by = $${base})`);
+    }
+
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const sql = `
+      SELECT a.*
+        FROM meetings_audit_v2 a
+        LEFT JOIN meetings m ON m.id = a.meeting_id
+        ${where}
+        ORDER BY a.performed_at DESC
+        LIMIT ${s} OFFSET ${offset}
+    `;
+    const rows = await pool.query(sql, params);
+    res.json({ items: rows.rows, page: p, pageSize: s });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Reminders audits: read endpoints ---
+app.get('/api/reminders/:id/audit-v2', requireAuth, async (req, res) => {
+  if (!FEATURE_REMINDERS_AUDIT) return res.status(404).json({ error: 'Not found' });
+  try {
+    const id = String(req.params.id);
+    // Visibility for EMPLOYEE: created_by_user_id or assigned_to_user_id or via linked meeting
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const uid = req.user.sub;
+      const r = await pool.query('SELECT created_by_user_id, created_by, assigned_to_user_id, assigned_to, meeting_id FROM reminders WHERE id=$1 LIMIT 1', [id]);
+      if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+      const row = r.rows[0];
+      const own = (row.created_by_user_id && String(row.created_by_user_id) === String(uid)) || (row.created_by && String(row.created_by) === String(actor));
+      const assigned = (row.assigned_to_user_id && String(row.assigned_to_user_id) === String(uid)) || (row.assigned_to && String(row.assigned_to) === String(actor));
+      let viaMeeting = false;
+      if (row.meeting_id) {
+        const m = await pool.query('SELECT 1 FROM meetings WHERE id=$1 AND (assigned_to_user_id=$2 OR created_by_user_id=$2 OR assigned_to=$3 OR created_by=$3) LIMIT 1', [row.meeting_id, uid, actor]);
+        viaMeeting = m.rows.length > 0;
+      }
+      if (!(own || assigned || viaMeeting)) return res.status(403).json({ error: 'Forbidden' });
+    }
+    const rows = await pool.query('SELECT * FROM reminders_audit_v2 WHERE reminder_id=$1 ORDER BY version ASC', [id]);
+    res.json({ items: rows.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/reminders/:id/email-audit', requireAuth, async (req, res) => {
+  if (!FEATURE_REMINDERS_AUDIT) return res.status(404).json({ error: 'Not found' });
+  try {
+    const id = String(req.params.id);
+    // Visibility for EMPLOYEE similar to above
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const uid = req.user.sub;
+      const r = await pool.query('SELECT created_by_user_id, created_by, assigned_to_user_id, assigned_to, meeting_id FROM reminders WHERE id=$1 LIMIT 1', [id]);
+      if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+      const row = r.rows[0];
+      const own = (row.created_by_user_id && String(row.created_by_user_id) === String(uid)) || (row.created_by && String(row.created_by) === String(actor));
+      const assigned = (row.assigned_to_user_id && String(row.assigned_to_user_id) === String(uid)) || (row.assigned_to && String(row.assigned_to) === String(actor));
+      let viaMeeting = false;
+      if (row.meeting_id) {
+        const m = await pool.query('SELECT 1 FROM meetings WHERE id=$1 AND (assigned_to_user_id=$2 OR created_by_user_id=$2 OR assigned_to=$3 OR created_by=$3) LIMIT 1', [row.meeting_id, uid, actor]);
+        viaMeeting = m.rows.length > 0;
+      }
+      if (!(own || assigned || viaMeeting)) return res.status(403).json({ error: 'Forbidden' });
+    }
+    const rows = await pool.query('SELECT * FROM reminder_email_selected_audit WHERE reminder_id=$1 ORDER BY performed_at DESC', [id]);
+    res.json({ items: rows.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Read call attempt audit for a specific reminder
+app.get('/api/reminders/:id/call-audit', requireAuth, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    // Visibility for EMPLOYEE mirrors email-audit
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const uid = req.user.sub;
+      const r = await pool.query('SELECT created_by_user_id, created_by, assigned_to_user_id, assigned_to, meeting_id FROM reminders WHERE id=$1 LIMIT 1', [id]);
+      if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+      const row = r.rows[0];
+      const own = (row.created_by_user_id && String(row.created_by_user_id) === String(uid)) || (row.created_by && String(row.created_by) === String(actor));
+      const assigned = (row.assigned_to_user_id && String(row.assigned_to_user_id) === String(uid)) || (row.assigned_to && String(row.assigned_to) === String(actor));
+      let viaMeeting = false;
+      if (row.meeting_id) {
+        const m = await pool.query('SELECT 1 FROM meetings WHERE id=$1 AND (assigned_to_user_id=$2 OR created_by_user_id=$2 OR assigned_to=$3 OR created_by=$3) LIMIT 1', [row.meeting_id, uid, actor]);
+        viaMeeting = m.rows.length > 0;
+      }
+      if (!(own || assigned || viaMeeting)) return res.status(403).json({ error: 'Forbidden' });
+    }
+    // If table not present, return empty array gracefully
+    try {
+      const rows = await pool.query('SELECT * FROM reminder_call_attempt_audit WHERE reminder_id=$1 ORDER BY performed_at DESC', [id]);
+      res.json({ items: rows.rows });
+    } catch (e) {
+      // Table likely missing; degrade
+      res.json({ items: [] });
+    }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Global listings with filters
+app.get('/api/reminders-audit-v2', requireAuth, async (req, res) => {
+  if (!FEATURE_REMINDERS_AUDIT) return res.status(404).json({ error: 'Not found' });
+  try {
+    let { reminderId, action, dateFrom, dateTo, page = 1, pageSize = 50 } = req.query || {};
+    const p = clampInt(page, 1, 100000, 1);
+    const s = clampInt(pageSize, 1, 500, 50);
+    const offset = (p - 1) * s;
+    const params = [];
+    const filters = [];
+    if (reminderId) {
+      params.push(`%${String(reminderId).trim()}%`);
+      filters.push(`a.reminder_id ILIKE $${params.length}`);
+    }
+    if (action) {
+      const list = String(action).split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+      if (list.length) {
+        const ph = list.map((_, i) => `$${params.length + i + 1}`).join(',');
+        params.push(...list);
+        filters.push(`a.action IN (${ph})`);
+      }
+    }
+    if (dateFrom && isValidDateTimeString(dateFrom)) { params.push(dateFrom); filters.push(`a.performed_at >= $${params.length}`); }
+    if (dateTo && isValidDateTimeString(dateTo)) { params.push(dateTo); filters.push(`a.performed_at <= $${params.length}`); }
+
+    // Visibility guard for EMPLOYEE using reminders and linked meeting
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const uid = req.user.sub;
+      params.push(uid, uid, actor, actor);
+      const base = params.length;
+      filters.push(`(
+        r.created_by_user_id = $${base-3} OR r.assigned_to_user_id = $${base-2} OR r.created_by = $${base-1} OR r.assigned_to = $${base}
+        OR (r.meeting_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM meetings m WHERE m.id = r.meeting_id AND (m.assigned_to_user_id = $${base-3} OR m.created_by_user_id = $${base-3} OR m.assigned_to = $${base-1} OR m.created_by = $${base})
+            ))
+      )`);
+    }
+
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const sql = `
+      SELECT a.*
+        FROM reminders_audit_v2 a
+        LEFT JOIN reminders r ON r.id = a.reminder_id
+        ${where}
+        ORDER BY a.performed_at DESC
+        LIMIT ${s} OFFSET ${offset}
+    `;
+    const rows = await pool.query(sql, params);
+    res.json({ items: rows.rows, page: p, pageSize: s });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/reminders-email-selected-audit', requireAuth, async (req, res) => {
+  if (!FEATURE_REMINDERS_AUDIT) return res.status(404).json({ error: 'Not found' });
+  try {
+    let { operationId, reminderId, status, page = 1, pageSize = 50 } = req.query || {};
+    const p = clampInt(page, 1, 100000, 1);
+    const s = clampInt(pageSize, 1, 500, 50);
+    const offset = (p - 1) * s;
+    const params = [];
+    const filters = [];
+    if (operationId) { params.push(String(operationId)); filters.push(`a.operation_id = $${params.length}`); }
+    if (reminderId) { params.push(String(reminderId)); filters.push(`a.reminder_id = $${params.length}`); }
+    if (status) {
+      const list = String(status).split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+      if (list.length) {
+        const ph = list.map((_, i) => `$${params.length + i + 1}`).join(',');
+        params.push(...list);
+        filters.push(`a.status IN (${ph})`);
+      }
+    }
+    // Visibility for EMPLOYEE
+    if (req.user && req.user.role === 'EMPLOYEE') {
+      const actor = getActor(req);
+      const uid = req.user.sub;
+      params.push(uid, uid, actor, actor);
+      const base = params.length;
+      filters.push(`(
+        r.created_by_user_id = $${base-3} OR r.assigned_to_user_id = $${base-2} OR r.created_by = $${base-1} OR r.assigned_to = $${base}
+        OR (r.meeting_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM meetings m WHERE m.id = r.meeting_id AND (m.assigned_to_user_id = $${base-3} OR m.created_by_user_id = $${base-3} OR m.assigned_to = $${base-1} OR m.created_by = $${base})
+            ))
+      )`);
+    }
+
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const sql = `
+      SELECT a.*
+        FROM reminder_email_selected_audit a
+        LEFT JOIN reminders r ON r.id = a.reminder_id
+        ${where}
+        ORDER BY a.performed_at DESC
+        LIMIT ${s} OFFSET ${offset}
+    `;
+    const rows = await pool.query(sql, params);
+    res.json({ items: rows.rows, page: p, pageSize: s });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -2831,6 +6394,8 @@ app.put('/api/reminders/:id', requireAuth, async (req, res) => {
        WHERE id=$11 RETURNING *`,
       [title, dueDate ? normalizeLocal(dueDate) : row.due_ts, notes, status, notifyAtDate ? normalizeLocal(notifyAtDate) : row.notify_at, receiver_email || null, person_name, phone || null, newAssignedLabel, newAssignedUserId, id]
     );
+    // Audit (UPDATE)
+    try { await insertReminderAuditV2(pool, 'UPDATE', row, updated.rows[0], null, req); } catch (e) { /* best-effort */ }
     res.json(updated.rows[0]);
   } catch (err) {
     console.error(err);
@@ -2852,16 +6417,58 @@ app.patch('/api/reminders/:id', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Nothing to update' });
     }
     // Guard: Employees can update only reminders they created
-    if (req.user && req.user.role === 'EMPLOYEE') {
-      const cur = await pool.query('SELECT created_by, created_by_user_id FROM reminders WHERE id=$1', [id]);
+    let beforeRow = null;
+    {
+      const cur = await pool.query('SELECT * FROM reminders WHERE id=$1', [id]);
       if (!cur.rows.length) return res.status(404).json({ error: 'Not found' });
-      const actor = getActor(req);
-      if (cur.rows[0].created_by_user_id !== req.user.sub && String(cur.rows[0].created_by || '') !== String(actor)) {
-        return res.status(403).json({ error: 'Employees can update only reminders they created' });
+      beforeRow = cur.rows[0];
+      if (req.user && req.user.role === 'EMPLOYEE') {
+        const actor = getActor(req);
+        const isCreator = (beforeRow.created_by_user_id === req.user.sub) || (String(beforeRow.created_by || '') === String(actor));
+        const isAssigneeSelf = (beforeRow.assigned_to_user_id && String(beforeRow.assigned_to_user_id) === String(req.user.sub)) || (beforeRow.assigned_to && String(beforeRow.assigned_to) === String(actor));
+        const newStatus = String(status).toUpperCase();
+        const isTerminal = ['DONE','SENT','FAILED'].includes(String(beforeRow.status || '').toUpperCase());
+        const isAllowedRevert = isAssigneeSelf && newStatus === 'PENDING' && isTerminal;
+        if (!isCreator && !isAllowedRevert) {
+          return res.status(403).json({ error: 'Employees can update only reminders they created (or revert assigned reminders to PENDING)' });
+        }
       }
     }
-    const r = await pool.query('UPDATE reminders SET status=$1 WHERE id=$2 RETURNING *', [String(status).toUpperCase(), id]);
+    const newStatus = String(status).toUpperCase();
+    const r = await pool.query('UPDATE reminders SET status=$1 WHERE id=$2 RETURNING *', [newStatus, id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    // Audit (STATUS)
+    try {
+      let auditNote = null;
+      const wasTerminal = ['DONE','SENT','FAILED'].includes(String(beforeRow.status || '').toUpperCase());
+      if (newStatus === 'PENDING' && wasTerminal) {
+        auditNote = 'revert_to_pending';
+      }
+      await insertReminderAuditV2(pool, 'STATUS', beforeRow, r.rows[0], auditNote, req);
+    } catch (e) { /* best-effort */ }
+    // If this is a CALL reminder, also record a call attempt audit row (COMPLETED/FAILED)
+    try {
+      if (beforeRow && String(beforeRow.type || '').toUpperCase() === 'CALL') {
+        const actor = getActor(req);
+        const actorUserId = req.user && req.user.sub;
+        // Map reminder status to call attempt status
+        let callStatus = null;
+        if (newStatus === 'DONE') callStatus = 'COMPLETED';
+        else if (newStatus === 'FAILED') callStatus = 'FAILED';
+        else if (newStatus === 'PENDING') callStatus = 'INITIATED';
+        if (callStatus) {
+          // best-effort insert; table presence governed by feature flag
+          await pool.query(
+            `INSERT INTO reminder_call_attempt_audit (reminder_id, performed_by_user_id, performed_by, phone, status)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [String(id), actorUserId || null, actor || null, beforeRow.phone || null, callStatus]
+          );
+        }
+      }
+    } catch (e) {
+      // non-fatal
+      if (!process.env.SUPPRESS_DB_LOG) console.warn('[call_attempt_audit] insert failed:', e.message);
+    }
     res.json(r.rows[0]);
   } catch (err) {
     console.error(err);

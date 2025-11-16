@@ -1,60 +1,8 @@
 -- PostgreSQL schema for Sreenidhi CRM
 
 -- Try to enable pgcrypto for gen_random_uuid(); ignore if not permitted by provider
-DO $$
-BEGIN
-    BEGIN
-        CREATE EXTENSION IF NOT EXISTS pgcrypto;
-    EXCEPTION WHEN others THEN
-        -- Some managed providers block CREATE EXTENSION; proceed without it
-        NULL;
-    END;
 END $$;
-
--- Base tables (use IF NOT EXISTS to avoid errors if already present)
-CREATE TABLE IF NOT EXISTS opportunities (
-    opportunity_id VARCHAR(20) PRIMARY KEY,
-    client_name VARCHAR(128) NOT NULL,
-    purpose VARCHAR(128),
-    expected_monthly_volume_l INTEGER,
-    proposed_price_per_litre NUMERIC(10,2),
-    stage VARCHAR(32),
-    probability INTEGER,
-    notes TEXT,
-    salesperson VARCHAR(64),
-    assignment VARCHAR(16),
-    spend NUMERIC(12,2),
-    loss_reason TEXT
-);
-
--- Add new opportunity fields: sector and location_url (idempotent)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns WHERE table_name='opportunities' AND column_name='sector'
-    ) THEN
-        EXECUTE 'ALTER TABLE opportunities ADD COLUMN sector TEXT NULL';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns WHERE table_name='opportunities' AND column_name='location_url'
-    ) THEN
-        EXECUTE 'ALTER TABLE opportunities ADD COLUMN location_url TEXT NULL';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns WHERE table_name='opportunities' AND column_name='cancellation_reason'
-    ) THEN
-        EXECUTE 'ALTER TABLE opportunities ADD COLUMN cancellation_reason TEXT NULL';
-    END IF;
-    -- Drop old CHECK and recreate with expanded allowlist
-    IF EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'opportunities_sector_check'
-    ) THEN
-        BEGIN
-            EXECUTE 'ALTER TABLE opportunities DROP CONSTRAINT opportunities_sector_check';
-        EXCEPTION WHEN others THEN NULL; END;
-    END IF;
-        BEGIN
-                EXECUTE 'ALTER TABLE opportunities
+-- (fuel_lot_activities removed; audit now uses transfer tables and testing_self_transfers)
                                  ADD CONSTRAINT opportunities_sector_check
                                  CHECK (
                                      sector IS NULL OR sector IN (
@@ -230,6 +178,45 @@ BEGIN
     END IF;
 END $$;
 
+-- V2 Meetings audit with JSONB diff + snapshot (append-only)
+-- Keeps legacy meetings_audit untouched; new ingestion writes can target this table
+CREATE TABLE IF NOT EXISTS meetings_audit_v2 (
+    id BIGSERIAL PRIMARY KEY,
+    meeting_id VARCHAR(16) NOT NULL,
+    version INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('CREATE','UPDATE','CANCEL','COMPLETE','DELETE','RESCHEDULE')),
+    performed_by_user_id UUID NULL,
+    performed_by TEXT NULL,
+    performed_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    diff JSONB NULL,
+    snapshot JSONB NULL,
+    note TEXT NULL,
+    context JSONB NULL,
+    CONSTRAINT uniq_meetings_audit_v2_version UNIQUE (meeting_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_meetings_audit_v2_meeting ON meetings_audit_v2(meeting_id);
+CREATE INDEX IF NOT EXISTS idx_meetings_audit_v2_performed_at ON meetings_audit_v2(performed_at DESC);
+
+-- Meeting email invite audit: one row per send attempt
+CREATE TABLE IF NOT EXISTS meeting_email_audit (
+    id BIGSERIAL PRIMARY KEY,
+    meeting_id VARCHAR(16) NOT NULL,
+    performed_by_user_id UUID NULL,
+    performed_by TEXT NULL,
+    performed_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    subject TEXT,
+    to_recipients JSONB,
+    cc_recipients JSONB,
+    bcc_recipients JSONB,
+    status TEXT NOT NULL CHECK (status IN ('SENT','FAILED')),
+    message_id TEXT,
+    error TEXT,
+    sent_count INTEGER,
+    recipients_detail JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_meeting_email_audit_meeting ON meeting_email_audit(meeting_id);
+CREATE INDEX IF NOT EXISTS idx_meeting_email_audit_performed_at ON meeting_email_audit(performed_at DESC);
+
 -- Idempotent schema change: drop old notes columns and add outcome_notes
 DO $$
 BEGIN
@@ -339,6 +326,213 @@ BEGIN
         EXECUTE 'ALTER TABLE meetings ADD CONSTRAINT meetings_status_check CHECK (status IN (''SCHEDULED'',''COMPLETED'',''CANCELLED'',''NO_SHOW'',''RESCHEDULED''))';
     END IF;
 END $$;
+
+-- =========================
+-- Fuel Ops schema (lots, storage units) and helpers
+-- Idempotent and safe to re-apply
+-- =========================
+
+-- Storage units: trucks (tankers), datum tanks, dispensers
+CREATE TABLE IF NOT EXISTS public.storage_units (
+    id SERIAL PRIMARY KEY,
+    unit_type TEXT NOT NULL CHECK (unit_type IN ('TRUCK','DATUM','DISPENSER')),
+    unit_code TEXT NOT NULL UNIQUE,          -- short code like '4T1' for 4-ton truck #1
+    capacity_liters INTEGER NOT NULL CHECK (capacity_liters > 0),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_storage_units_type ON public.storage_units(unit_type);
+CREATE INDEX IF NOT EXISTS idx_storage_units_active ON public.storage_units(active) WHERE active = TRUE;
+
+-- Optional vehicle metadata on storage_units (TRUCK/DATUM)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns WHERE table_name='storage_units' AND column_name='vehicle_number'
+    ) THEN
+        ALTER TABLE public.storage_units ADD COLUMN vehicle_number TEXT NULL;
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_storage_units_vehicle_number ON public.storage_units(vehicle_number) WHERE vehicle_number IS NOT NULL;
+
+-- Fuel lots (enhanced schema)
+CREATE TABLE IF NOT EXISTS public.fuel_lots (
+    id BIGSERIAL PRIMARY KEY,
+    unit_id INTEGER NOT NULL REFERENCES public.storage_units(id) ON DELETE RESTRICT,
+    -- Snapshot at creation
+    tanker_code TEXT NOT NULL,               -- from storage_units.unit_code
+    tanker_capacity INTEGER NOT NULL CHECK (tanker_capacity > 0),
+    load_date DATE NOT NULL,
+    seq_index INTEGER NOT NULL CHECK (seq_index > 0),
+    seq_letters TEXT NOT NULL,
+    loaded_liters INTEGER NOT NULL CHECK (loaded_liters > 0),
+    lot_code_initial TEXT NOT NULL UNIQUE,   -- LOTDDMONYY[UnitCode][SeqLetters][Loaded]
+    -- Lifecycle and activity
+    activity TEXT NOT NULL DEFAULT 'NEW_LOAD' CHECK (activity IN ('NEW_LOAD','TANKER_TO_TANKER','TANKER_TO_DATUM','TANKER_TO_VEHICLE','DATUM_TO_VEHICLE')),
+    from_unit_code TEXT NULL,                -- applies to transfers
+    to_unit_code TEXT NULL,                  -- applies to transfers (tanker/datum)
+    to_vehicle TEXT NULL,                    -- applies to *to vehicle* activities
+    driver_id INTEGER NULL REFERENCES public.drivers(id) ON DELETE SET NULL,
+    driver_name TEXT NULL,
+    transfer_volume_liters INTEGER NULL CHECK (transfer_volume_liters IS NULL OR transfer_volume_liters >= 0),
+    sale_volume_liters INTEGER NULL CHECK (sale_volume_liters IS NULL OR sale_volume_liters >= 0),
+    cumulative_transfer_liters INTEGER NOT NULL DEFAULT 0 CHECK (cumulative_transfer_liters >= 0),
+    used_liters INTEGER NOT NULL DEFAULT 0 CHECK (used_liters >= 0),
+    lot_code_by_transfer TEXT NULL,          -- e.g., LOT...-2000
+    stock_status TEXT NOT NULL DEFAULT 'INSTOCK' CHECK (stock_status IN ('SOLD','INSTOCK')),
+    lot_sold_status TEXT NOT NULL DEFAULT 'INSTOCK' CHECK (lot_sold_status IN ('SOLD','INSTOCK')),
+    created_by TEXT NULL,
+    created_by_user_id UUID NULL,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    -- Per-unit-per-day uniqueness of sequence index
+    CONSTRAINT uniq_fuel_lots_per_unit_day_seq UNIQUE (unit_id, load_date, seq_index)
+);
+-- Create date index on the actual date column name (load_date vs loaded_date)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='fuel_lots' AND column_name='load_date'
+    ) THEN
+        BEGIN
+            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_fuel_lots_date ON public.fuel_lots(load_date DESC)';
+        EXCEPTION WHEN others THEN NULL; END;
+    ELSIF EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='fuel_lots' AND column_name='loaded_date'
+    ) THEN
+        BEGIN
+            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_fuel_lots_date ON public.fuel_lots(loaded_date DESC)';
+        EXCEPTION WHEN others THEN NULL; END;
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_fuel_lots_unit ON public.fuel_lots(unit_id);
+CREATE INDEX IF NOT EXISTS idx_fuel_lots_stock ON public.fuel_lots(stock_status);
+
+-- Convert 1 -> 'A', 2 -> 'B', 26 -> 'Z', 27 -> 'AA', etc.
+CREATE OR REPLACE FUNCTION public.seq_index_to_letters(idx INTEGER)
+RETURNS TEXT LANGUAGE plpgsql AS $$
+DECLARE
+    n INTEGER := idx;
+    result TEXT := '';
+    rem INTEGER;
+BEGIN
+    IF n IS NULL OR n < 1 THEN
+        RETURN '';
+    END IF;
+    WHILE n > 0 LOOP
+        rem := (n - 1) % 26;
+        result := chr(65 + rem) || result; -- 65 = 'A'
+        n := (n - 1) / 26;
+    END LOOP;
+    RETURN result;
+END $$;
+
+-- Build lot code: 'LOT' || DDMON || unit_code || letters || '-' || loaded
+-- Example: LOT25NOV4T1A-3400
+CREATE OR REPLACE FUNCTION public.gen_lot_code(
+    p_unit_code TEXT,
+    p_load_date DATE,
+    p_seq_index INTEGER,
+    p_loaded_liters INTEGER
+) RETURNS TEXT LANGUAGE sql AS $$
+    SELECT 'LOT' || to_char(p_load_date, 'DDMONYY') || p_unit_code || public.seq_index_to_letters(p_seq_index)
+           || CAST(p_loaded_liters AS TEXT);
+$$;
+
+-- Next sequence index for a given date (global per-day, not per unit)
+CREATE OR REPLACE FUNCTION public.next_seq_index_for_date(p_date DATE)
+RETURNS INTEGER LANGUAGE sql AS $$
+    SELECT COALESCE(MAX(seq_index), 0) + 1 FROM public.fuel_lots WHERE load_date = p_date;
+$$;
+
+-- Helper: preview next lot code for unit/date/liters without inserting
+CREATE OR REPLACE FUNCTION public.preview_next_lot_code(
+    p_unit_id INTEGER,
+    p_load_date DATE,
+    p_loaded_liters INTEGER
+) RETURNS TABLE(lot_code TEXT, seq_index INTEGER) LANGUAGE plpgsql AS $$
+DECLARE
+    v_unit_code TEXT;
+    v_cap INTEGER;
+    v_seq INTEGER;
+BEGIN
+    SELECT unit_code, capacity_liters INTO v_unit_code, v_cap FROM public.storage_units WHERE id = p_unit_id;
+    IF v_unit_code IS NULL THEN
+        RAISE EXCEPTION 'Unknown storage unit id %', p_unit_id USING ERRCODE = '22P02';
+    END IF;
+    v_seq := public.next_seq_index_for_date(p_load_date);
+    RETURN QUERY SELECT public.gen_lot_code(v_unit_code, p_load_date, v_seq, p_loaded_liters), v_seq;
+END $$;
+
+-- Safe insert: take advisory lock on date to prevent race on seq_index
+CREATE OR REPLACE FUNCTION public.create_fuel_lot(
+    p_unit_id INTEGER,
+    p_load_date DATE,
+    p_loaded_liters INTEGER
+) RETURNS public.fuel_lots LANGUAGE plpgsql AS $$
+DECLARE
+    v_unit public.storage_units%ROWTYPE;
+    v_seq INTEGER;
+    v_letters TEXT;
+    v_initial_code TEXT;
+    v_row public.fuel_lots%ROWTYPE;
+    v_key BIGINT;
+BEGIN
+    SELECT * INTO v_unit FROM public.storage_units WHERE id = p_unit_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown storage unit id %', p_unit_id USING ERRCODE = '22P02';
+    END IF;
+    IF p_loaded_liters <= 0 OR p_loaded_liters > v_unit.capacity_liters THEN
+        RAISE EXCEPTION 'Loaded liters % must be >0 and <= capacity %', p_loaded_liters, v_unit.capacity_liters USING ERRCODE = '22000';
+    END IF;
+    -- advisory lock key based on yyyymmdd of date
+    v_key := CAST(to_char(p_load_date, 'YYYYMMDD') AS BIGINT);
+    PERFORM pg_advisory_xact_lock(v_key);
+    v_seq := COALESCE((SELECT MAX(seq_index) FROM public.fuel_lots WHERE load_date = p_load_date), 0) + 1;
+    v_letters := public.seq_index_to_letters(v_seq);
+    v_initial_code := public.gen_lot_code(v_unit.unit_code, p_load_date, v_seq, p_loaded_liters);
+    INSERT INTO public.fuel_lots (
+        unit_id, tanker_code, tanker_capacity, load_date, seq_index, seq_letters,
+        loaded_liters, lot_code_initial, activity, stock_status, lot_sold_status,
+        cumulative_transfer_liters, used_liters
+    )
+    VALUES (
+        v_unit.id, v_unit.unit_code, v_unit.capacity_liters, p_load_date, v_seq, v_letters,
+        p_loaded_liters, v_initial_code, 'NEW_LOAD', 'INSTOCK', 'INSTOCK',
+        0, 0
+    )
+    RETURNING * INTO v_row;
+    RETURN v_row;
+END $$;
+
+-- (fuel_lot_activities removed; audit now uses transfer tables and testing_self_transfers)
+
+-- =========================
+-- Fuel Ops Readings
+-- =========================
+
+-- (truck_odometer_readings removed; use truck_odometer_day_readings and other odometer endpoints)
+
+-- Daily rollups with opening/closing semantics (authoritative for reconciliation)
+CREATE TABLE IF NOT EXISTS public.truck_odometer_day_readings (
+    id BIGSERIAL PRIMARY KEY,
+    truck_id INTEGER NOT NULL REFERENCES public.storage_units(id) ON DELETE RESTRICT,
+    reading_date DATE NOT NULL,
+    opening_km NUMERIC(14,3) NOT NULL CHECK (opening_km >= 0),
+    closing_km NUMERIC(14,3) NOT NULL CHECK (closing_km >= opening_km),
+    opening_at TIMESTAMP WITHOUT TIME ZONE NULL,
+    closing_at TIMESTAMP WITHOUT TIME ZONE NULL,
+    note TEXT,
+    created_by TEXT,
+    created_by_user_id UUID,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT uniq_truck_odometer_day UNIQUE (truck_id, reading_date)
+);
+CREATE INDEX IF NOT EXISTS idx_truck_odometer_day_truck_date ON public.truck_odometer_day_readings(truck_id, reading_date DESC);
+
 
 -- Add foreign keys for opportunity and contract if not present
 DO $$
@@ -662,6 +856,111 @@ BEGIN
                     AND r.meeting_id = m.id';
     EXCEPTION WHEN others THEN NULL; END;
 END $$;
+
+-- Reminders audit v2 (append-only)
+-- Mirrors migration 008_create_reminders_audit_v2.sql; kept idempotent
+CREATE TABLE IF NOT EXISTS reminders_audit_v2 (
+    id BIGSERIAL PRIMARY KEY,
+    reminder_id VARCHAR(20) NOT NULL,
+    version INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    performed_by_user_id UUID NULL REFERENCES public.users(id) ON DELETE SET NULL,
+    performed_by TEXT NULL,
+    performed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    diff JSONB NULL,
+    snapshot JSONB NULL,
+    note TEXT NULL,
+    context JSONB NULL,
+    CONSTRAINT reminders_audit_v2_unique_per_reminder_version UNIQUE(reminder_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_audit_v2_reminder_version ON reminders_audit_v2(reminder_id, version);
+CREATE INDEX IF NOT EXISTS idx_reminders_audit_v2_performed_at ON reminders_audit_v2(performed_at DESC);
+
+-- Add reminder_type column to reminders_audit_v2 and backfill idempotently
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='reminders_audit_v2' AND column_name='reminder_type'
+    ) THEN
+        BEGIN
+            EXECUTE 'ALTER TABLE reminders_audit_v2 ADD COLUMN reminder_type TEXT NULL';
+        EXCEPTION WHEN others THEN NULL; END;
+    END IF;
+    -- Backfill from snapshot first
+    BEGIN
+        EXECUTE 'UPDATE reminders_audit_v2 SET reminder_type = COALESCE(reminder_type, snapshot->>''type'') WHERE reminder_type IS NULL AND snapshot IS NOT NULL';
+    EXCEPTION WHEN others THEN NULL; END;
+    -- Backfill remaining from reminders table
+    BEGIN
+        EXECUTE 'UPDATE reminders_audit_v2 a SET reminder_type = r.type FROM reminders r WHERE a.reminder_type IS NULL AND r.id = a.reminder_id';
+    EXCEPTION WHEN others THEN NULL; END;
+END $$;
+
+-- Reminder Email Selected audit (one row per send attempt)
+-- Mirrors migration 009_create_reminder_email_selected_audit.sql; kept idempotent
+CREATE TABLE IF NOT EXISTS reminder_email_selected_audit (
+    id BIGSERIAL PRIMARY KEY,
+    operation_id UUID NOT NULL,
+    reminder_id VARCHAR(20) NOT NULL,
+    performed_by_user_id UUID NULL REFERENCES public.users(id) ON DELETE SET NULL,
+    performed_by TEXT NULL,
+    performed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    subject TEXT NULL,
+    to_recipients JSONB NOT NULL DEFAULT '[]'::jsonb,
+    cc_recipients JSONB NOT NULL DEFAULT '[]'::jsonb,
+    bcc_recipients JSONB NOT NULL DEFAULT '[]'::jsonb,
+    recipients_dedup JSONB NOT NULL DEFAULT '[]'::jsonb,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    message_id TEXT NULL,
+    error TEXT NULL,
+    meta JSONB NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resa_reminder_performed_at ON reminder_email_selected_audit(reminder_id, performed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_resa_operation_id ON reminder_email_selected_audit(operation_id);
+CREATE INDEX IF NOT EXISTS idx_resa_status_sent_partial ON reminder_email_selected_audit(reminder_id) WHERE status = 'SENT';
+
+-- Add reminder_type column to reminder_email_selected_audit and backfill idempotently
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='reminder_email_selected_audit' AND column_name='reminder_type'
+    ) THEN
+        BEGIN
+            EXECUTE 'ALTER TABLE reminder_email_selected_audit ADD COLUMN reminder_type TEXT NULL';
+        EXCEPTION WHEN others THEN NULL; END;
+    END IF;
+    -- Backfill from reminders table
+    BEGIN
+        EXECUTE 'UPDATE reminder_email_selected_audit a SET reminder_type = r.type FROM reminders r WHERE a.reminder_type IS NULL AND r.id = a.reminder_id';
+    EXCEPTION WHEN others THEN NULL; END;
+END $$;
+
+-- Reminder Call Attempt audit (one row per call attempt)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='reminder_call_attempt_audit'
+    ) THEN
+        CREATE TABLE public.reminder_call_attempt_audit (
+            id BIGSERIAL PRIMARY KEY,
+            reminder_id VARCHAR(20) NOT NULL,
+            performed_by_user_id UUID NULL REFERENCES public.users(id) ON DELETE SET NULL,
+            performed_by TEXT NULL,
+            performed_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+            phone TEXT NULL,
+            status TEXT NOT NULL CHECK (status IN ('INITIATED','COMPLETED','FAILED')),
+            error TEXT NULL,
+            meta JSONB NULL
+        );
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_rcaa_reminder_performed_at ON public.reminder_call_attempt_audit(reminder_id, performed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rcaa_status_completed_partial ON public.reminder_call_attempt_audit(reminder_id) WHERE status = 'COMPLETED';
 
 -- ==================================
 -- Targets (Upcoming Campaign Targets)
