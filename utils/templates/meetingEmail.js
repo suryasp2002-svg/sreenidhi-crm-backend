@@ -1,4 +1,6 @@
 const { generateGoogleCalendarLink, generateOutlookCalendarLink, generateTeamsLink } = require('../calendar');
+const fs = require('fs');
+const path = require('path');
 
 function escapeHtml(s = '') {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
@@ -12,6 +14,19 @@ function stripUrls(text = '') {
     .trim();
 }
 
+function resolveInlineLogo() {
+  const envB64 = process.env.EMAIL_LOGO_BASE64 && process.env.EMAIL_LOGO_BASE64.trim();
+  if (envB64) return `data:image/png;base64,${envB64}`;
+  const filePath = process.env.EMAIL_LOGO_PATH || path.join(__dirname, '../../assets/logo.png');
+  try {
+    if (fs.existsSync(filePath)) {
+      const buf = fs.readFileSync(filePath);
+      return `data:image/png;base64,${buf.toString('base64')}`;
+    }
+  } catch {}
+  return null;
+}
+
 function meetingEmailHtml(meeting) {
   const { id, title, clientName, personName, dateText, timeText, location, meetingLink } = meeting;
   const googleUrl = generateGoogleCalendarLink(meeting);
@@ -21,8 +36,15 @@ function meetingEmailHtml(meeting) {
   const isProd = (process.env.NODE_ENV || '').toLowerCase() === 'production';
   // Prefer an explicit email-safe absolute URL; else try site origin; else dev localhost; else relative for preview
   const ui = process.env.SITE_ORIGIN || process.env.FRONTEND_ORIGIN || (!isProd ? 'http://localhost:3000' : '');
-  const logoUrl = process.env.EMAIL_LOGO_URL
-    || (ui ? `${ui.replace(/\/$/, '')}/assets/branding/logo.png` : '/assets/branding/logo.png');
+  // Build a robust absolute logo URL: prefer explicit EMAIL_LOGO_URL, else UI origin, else API origin host, else localhost.
+  const originFallback = ui || (api ? api.replace(/\/$/, '') : 'http://localhost:3000');
+  const versionTag = process.env.EMAIL_LOGO_VERSION ? `?v=${encodeURIComponent(process.env.EMAIL_LOGO_VERSION)}` : '';
+  const baseLogo = (process.env.EMAIL_LOGO_URL && process.env.EMAIL_LOGO_URL.trim())
+    ? process.env.EMAIL_LOGO_URL.trim()
+    : `${originFallback.replace(/\/$/, '')}/assets/logo.png`;
+  const logoUrl = `${baseLogo}${versionTag}`;
+  const inlineLogo = resolveInlineLogo();
+  const finalLogo = inlineLogo || logoUrl;
   const icsUrl = `${api}/api/meetings/${encodeURIComponent(id)}/ics`;
   // Prefer webcal:// scheme for Apple to open Calendar app on iOS when API_ORIGIN is a real host
   const preferWebcal = api && !/^(https?:\/\/)?(localhost|127\.0\.0\.1)(:|$)/i.test(api);
@@ -35,7 +57,7 @@ function meetingEmailHtml(meeting) {
       <tr>
         <td style="background:#d62839;padding:20px 24px;color:#fff;">
           <div style="display:flex;align-items:center;gap:12px;">
-            ${logoUrl ? `<img src="${logoUrl}" alt="Logo" width="44" height="44" style="display:block;border-radius:50%;object-fit:cover" />` : `<div style=\"background:#ffd54d;color:#111;width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;\">SF</div>`}
+            ${finalLogo ? `<img src="${finalLogo}" alt="Sreenidhi Fuels Logo" width="160" style="display:block;height:auto;object-fit:contain" />` : `<div style=\"background:#ffd54d;color:#111;width:160px;height:60px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:28px;\">SF</div>`}
             <div>
               <div style="font-size:18px;font-weight:800;letter-spacing:.3px;">SREENIDHI</div>
               <div style="font-size:12px;opacity:.9;margin-top:-2px;">FUELS</div>
@@ -47,7 +69,6 @@ function meetingEmailHtml(meeting) {
       <tr>
         <td style="padding:24px;">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-            <div style="width:24px;height:24px;border-radius:6px;background:#f43f5e;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;">1</div>
             <div style="font-size:22px;font-weight:800;">New Meeting Scheduled</div>
           </div>
           <p style="color:#4b5563;font-size:14px;margin:8px 0 16px;">A new meeting has been created in your CRM schedule. Below are the details:</p>

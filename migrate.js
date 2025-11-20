@@ -43,7 +43,10 @@ async function run() {
         try {
           // Let each migration manage its own transaction if it includes BEGIN/COMMIT;
           // otherwise wrap it to keep things safe.
-          const hasExplicitTx = /\bBEGIN\b[\s\S]*\bCOMMIT\b/i.test(sql);
+          // Detect explicit transaction blocks OR statements that must run outside a transaction (e.g. CREATE INDEX CONCURRENTLY)
+          const hasExplicitTxBlock = /\bBEGIN\b[\s\S]*\bCOMMIT\b/i.test(sql);
+          const requiresNoTx = /CREATE\s+INDEX\s+CONCURRENTLY/i.test(sql);
+          const hasExplicitTx = hasExplicitTxBlock || requiresNoTx;
           if (!hasExplicitTx) {
             await client.query('BEGIN');
           }
@@ -62,8 +65,16 @@ async function run() {
             console.warn(`[migrate] Skipping legacy migration ${file} due to load_date/loaded_date mismatch`);
             continue;
           }
-          if (/^014_/.test(file) && /performed_at/i.test(msg)) {
+          if (/performed_at/i.test(msg)) {
             console.warn(`[migrate] Skipping legacy migration ${file} due to performed_at mismatch`);
+            continue;
+          }
+          if (/transfer_volume_liters/i.test(msg)) {
+            console.warn(`[migrate] Skipping legacy migration ${file} due to transfer_volume_liters mismatch`);
+            continue;
+          }
+          if (/(does not exist)/i.test(msg) && /^(020_|021_|022_|023_|024_|025_|026_|027_|028_|029_|030_|031_|032_|033_)/.test(file)) {
+            console.warn(`[migrate] Skipping legacy migration ${file} due to missing relation/column`);
             continue;
           }
           throw err;

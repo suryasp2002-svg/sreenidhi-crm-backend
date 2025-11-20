@@ -52,14 +52,36 @@ function reminderCard(rem, idx) {
     </table>`;
 }
 
+const fs = require('fs');
+const path = require('path');
+
+function resolveInlineLogo() {
+  const envB64 = process.env.EMAIL_LOGO_BASE64 && process.env.EMAIL_LOGO_BASE64.trim();
+  if (envB64) return `data:image/png;base64,${envB64}`;
+  const filePath = process.env.EMAIL_LOGO_PATH || path.join(__dirname, '../../assets/logo.png');
+  try {
+    if (fs.existsSync(filePath)) {
+      const buf = fs.readFileSync(filePath);
+      return `data:image/png;base64,${buf.toString('base64')}`;
+    }
+  } catch {}
+  return null;
+}
+
 function remindersEmailHtml(payload) {
   // payload: { items: Array<...>, calendar?: { googleUrl, appleUrl, outlookUrl, teamsUrl, icsUrl } }
   const items = Array.isArray(payload?.items) ? payload.items : [];
   const calendar = payload && payload.calendar || {};
   const isProd = (process.env.NODE_ENV || '').toLowerCase() === 'production';
   const ui = process.env.SITE_ORIGIN || process.env.FRONTEND_ORIGIN || (!isProd ? 'http://localhost:3000' : '');
-  const logoUrl = process.env.EMAIL_LOGO_URL
-    || (ui ? `${ui.replace(/\/$/, '')}/assets/branding/logo.png` : '/assets/branding/logo.png');
+  const originFallback = ui || (process.env.API_ORIGIN ? process.env.API_ORIGIN.replace(/\/$/, '') : 'http://localhost:3000');
+  const versionTag = process.env.EMAIL_LOGO_VERSION ? `?v=${encodeURIComponent(process.env.EMAIL_LOGO_VERSION)}` : '';
+  const rawBase = process.env.EMAIL_LOGO_URL && process.env.EMAIL_LOGO_URL.trim()
+    ? process.env.EMAIL_LOGO_URL.trim()
+    : `${originFallback.replace(/\/$/, '')}/assets/logo.png`;
+  const rawLogo = `${rawBase}${versionTag}`;
+  const inlineLogo = resolveInlineLogo();
+  const logoUrl = inlineLogo || rawLogo;
 
   const buttons = `
     <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:18px;">
@@ -77,7 +99,7 @@ function remindersEmailHtml(payload) {
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
             <tr>
               <td style="vertical-align:middle;width:48px;">
-                ${logoUrl ? `<img src="${logoUrl}" alt="Logo" width="48" height="48" style="display:block;border-radius:50%;object-fit:cover" />` : `<div style=\"background:#ffd54d;color:#111;width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;\">SF</div>`}
+                ${logoUrl ? `<img src="${logoUrl}" alt="Sreenidhi Fuels Logo" width="140" style="display:block;height:auto;object-fit:contain" />` : `<div style=\"background:#ffd54d;color:#111;width:140px;height:50px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:26px;\">SF</div>`}
               </td>
               <td style="vertical-align:middle;">
                 <div style="font-size:20px;font-weight:800;letter-spacing:.3px">Sreenidhi Fuels</div>

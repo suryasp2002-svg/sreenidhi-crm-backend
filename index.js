@@ -3483,8 +3483,8 @@ function coerceLocalSqlTimestamp(input) {
 }
 async function validateSelectableUserId(db, userId) {
   if (!userId) return null;
-  // We consider OWNER or EMPLOYEE selectable; active only
-  const r = await db.query(`SELECT id FROM public.users WHERE id=$1 AND active=TRUE AND role IN ('OWNER','EMPLOYEE')`, [userId]);
+  // Allow OWNER, EMPLOYEE, and ADMIN as selectable (needed for Admin "My Overview")
+  const r = await db.query(`SELECT id FROM public.users WHERE id=$1 AND active=TRUE AND role IN ('OWNER','EMPLOYEE','ADMIN')`, [userId]);
   return r.rows.length ? r.rows[0].id : null;
 }
 // Example route to test DB connection
@@ -4570,11 +4570,18 @@ app.delete('/api/expenses/:id', requireAuth, async (req, res) => {
 });
 
 // --- Meetings CRUD (enhanced) ---
+// Normalize a timestamp from the client preserving LOCAL wall time.
+// Accepts:
+//  - "YYYY-MM-DD HH:mm[:ss]" (treated as local)
+//  - "YYYY-MM-DDTHH:mm[:ss]" (treated as local)
+//  - ISO with timezone (Z or +hh:mm)
+// Always returns an SQL local timestamp string (YYYY-MM-DD HH:mm:ss)
 function normalizeTimestamp(ts) {
   if (!ts) return null;
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0,19).replace('T',' ');
+  // Reuse local-safe helpers defined below
+  const d = toLocalDate(ts);
+  if (!d) return null;
+  return formatLocalSQL(d);
 }
 
 // --- Local time helpers (avoid UTC shifts for reminders) ---

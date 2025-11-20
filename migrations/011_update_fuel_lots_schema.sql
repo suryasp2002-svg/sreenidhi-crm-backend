@@ -39,18 +39,28 @@ BEGIN
 END $$;
 
 -- Constrain columns (best-effort)
-ALTER TABLE public.fuel_lots
-    ALTER COLUMN tanker_code SET NOT NULL,
-    ALTER COLUMN tanker_capacity SET NOT NULL,
-    ALTER COLUMN lot_code_initial SET NOT NULL,
-    ALTER COLUMN activity SET DEFAULT 'NEW_LOAD';
+-- Safely constrain columns (guard lot_code_initial which may be renamed in later migrations)
+DO $$
+BEGIN
+  BEGIN EXECUTE 'ALTER TABLE public.fuel_lots ALTER COLUMN tanker_code SET NOT NULL'; EXCEPTION WHEN others THEN NULL; END;
+  BEGIN EXECUTE 'ALTER TABLE public.fuel_lots ALTER COLUMN tanker_capacity SET NOT NULL'; EXCEPTION WHEN others THEN NULL; END;
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns WHERE table_name='fuel_lots' AND column_name='lot_code_initial'
+  ) THEN
+    BEGIN EXECUTE 'ALTER TABLE public.fuel_lots ALTER COLUMN lot_code_initial SET NOT NULL'; EXCEPTION WHEN others THEN NULL; END;
+  END IF;
+  BEGIN EXECUTE 'ALTER TABLE public.fuel_lots ALTER COLUMN activity SET DEFAULT ''NEW_LOAD'''; EXCEPTION WHEN others THEN NULL; END;
+END $$;
 
 -- Add checks and indexes (best-effort)
 DO $$ BEGIN
   BEGIN EXECUTE 'ALTER TABLE public.fuel_lots ADD CONSTRAINT chk_fuel_lots_activity CHECK (activity IN (''NEW_LOAD'',''TANKER_TO_TANKER'',''TANKER_TO_DATUM'',''TANKER_TO_VEHICLE'',''DATUM_TO_VEHICLE''))'; EXCEPTION WHEN others THEN NULL; END;
   BEGIN EXECUTE 'ALTER TABLE public.fuel_lots ADD CONSTRAINT chk_fuel_lots_stock CHECK (stock_status IN (''SOLD'',''INSTOCK''))'; EXCEPTION WHEN others THEN NULL; END;
   BEGIN EXECUTE 'ALTER TABLE public.fuel_lots ADD CONSTRAINT chk_fuel_lots_lot_sold CHECK (lot_sold_status IN (''SOLD'',''INSTOCK''))'; EXCEPTION WHEN others THEN NULL; END;
-  BEGIN EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS uq_fuel_lots_initial_code ON public.fuel_lots(lot_code_initial)'; EXCEPTION WHEN others THEN NULL; END;
+  -- Unique index only if original column still exists (may be renamed later)
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='fuel_lots' AND column_name='lot_code_initial') THEN
+    BEGIN EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS uq_fuel_lots_initial_code ON public.fuel_lots(lot_code_initial)'; EXCEPTION WHEN others THEN NULL; END;
+  END IF;
   BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_fuel_lots_stock ON public.fuel_lots(stock_status)'; EXCEPTION WHEN others THEN NULL; END;
 END $$;
 

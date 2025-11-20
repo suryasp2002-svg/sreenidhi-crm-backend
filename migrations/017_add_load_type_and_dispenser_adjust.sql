@@ -83,18 +83,29 @@ BEGIN
 END $$;
 
 -- Backfill cumulative adjustment per from_unit ordered by time
-WITH sums AS (
-  SELECT id,
-         SUM(transfer_volume_liters) OVER (
-           PARTITION BY from_unit_id
-           ORDER BY performed_at, id
-           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-         )::int AS cum
-    FROM public.fuel_internal_transfers
-)
-UPDATE public.fuel_internal_transfers fit
-   SET dispenser_reading_transfer_adjust = s.cum
-  FROM sums s
- WHERE s.id = fit.id;
+-- Backfill cumulative adjustment only if legacy column transfer_volume_liters exists
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema='public'
+       AND table_name='fuel_internal_transfers'
+       AND column_name='transfer_volume_liters'
+  ) THEN
+    WITH sums AS (
+      SELECT id,
+             SUM(transfer_volume_liters) OVER (
+               PARTITION BY from_unit_id
+               ORDER BY performed_at, id
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             )::int AS cum
+        FROM public.fuel_internal_transfers
+    )
+    UPDATE public.fuel_internal_transfers fit
+       SET dispenser_reading_transfer_adjust = s.cum
+      FROM sums s
+     WHERE s.id = fit.id;
+  END IF;
+END $$;
 
 COMMIT;

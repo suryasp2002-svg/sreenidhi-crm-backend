@@ -1,0 +1,52 @@
+
+  <div style="font-family:Inter,Segoe UI,Helvetica,Arial,sans-serif;background:#f6f7f9;padding:24px;">
+    <table role="presentation" cellspacing="0" cellpadding="0" width="100%" style="max-width:640px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,0.06);">
+      <tr>
+        <td style="background:#d62839;padding:20px 24px;color:#fff;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <img src="http://localhost:3000/assets/branding/logo.png" alt="Sreenidhi Fuels Logo" width="160" style="display:block;height:auto;object-fit:contain" />
+            <div>
+              <div style="font-size:18px;font-weight:800;letter-spacing:.3px;">SREENIDHI</div>
+              <div style="font-size:12px;opacity:.9;margin-top:-2px;">FUELS</div>
+            </div>
+          </div>
+          <div style="margin-top:12px;font-size:15px;letter-spacing:.5px;">MEETING NOTIFICATION</div>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:24px;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+            <div style="font-size:22px;font-weight:800;">New Meeting Scheduled</div>
+          </div>
+          <p style="color:#4b5563;font-size:14px;margin:8px 0 16px;">A new meeting has been created in your CRM schedule. Below are the details:</p>
+          <table role="presentation" cellspacing="0" cellpadding="0" width="100%" style="border-top:1px solid #eee;margin-top:8px;padding-top:12px;">
+            <tr><td style="padding:6px 0;width:140px;color:#6b7280;">Client:</td><td style="padding:6px 0;color:#111;font-weight:600;">siddu</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280;">Title:</td><td style="padding:6px 0;color:#111;">Week-1 payment discussion</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280;">Person:</td><td style="padding:6px 0;color:#111;">kiran</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280;">Date:</td><td style="padding:6px 0;color:#111;">Fri, 21 Nov, 2025</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280;">Time:</td><td style="padding:6px 0;color:#111;">11:00 am – 12:00 pm</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280;">Location:</td><td style="padding:6px 0;color:#111;">Office (Hyderabad)</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280;">Meeting Link:</td><td style="padding:6px 0;"><a href="https://example.com/meet/abc" style="color:#dc2626;text-decoration:none;">Join Meeting</a></td></tr>
+          </table>
+          <div style="margin:18px 0 8px;height:1px;background:#eee;"></div>
+          <div style="display:flex;flex-wrap:wrap;gap:10px;">
+            <a href="https://www.google.com/calendar/render?action=TEMPLATE&text=Week-1+payment+discussion+%E2%80%93+siddu&details=Join%3A+https%3A%2F%2Fexample.com%2Fmeet%2Fabc&location=Office+%28Hyderabad%29&dates=20251121T172657Z%2F20251121T182657Z" style="background:#1a73e8;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;">Add to Google Calendar</a>
+            <a href="/api/meetings/sample-meeting-1/ics" target="_blank" style="background:#111827;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block;">Add to Apple Calendar</a>
+            <a href="https://teams.microsoft.com/l/meeting/new?subject=Week-1+payment+discussion+%E2%80%93+siddu&startTime=2025-11-21T17%3A26%3A57.812Z&endTime=2025-11-21T18%3A26%3A57.812Z&content=Join%3A+https%3A%2F%2Fexample.com%2Fmeet%2Fabc&location=Office+%28Hyderabad%29" style="background:#4f46e5;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:600;">Add to Teams Calendar</a>
+            <a href="https://outlook.live.com/calendar/0/deeplink/compose?path=%2Fcalendar%2Faction%2Fcompose&rru=addevent&subject=Week-1+payment+discussion+%E2%80%93+siddu&startdt=2025-11-21T17%3A26%3A57.812Z&enddt=2025-11-21T18%3A26%3A57.812Z&body=Join%3A+https%3A%2F%2Fexample.com%2Fmeet%2Fabc&location=Office+%28Hyderabad%29" style="background:#1a73e8;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:600;">Add to Outlook Calendar</a>
+          </div>
+          <div style="margin-top:8px;color:#6b7280;font-size:12px;">If the Apple button doesn’t open your calendar in some email apps, <a href="/api/meetings/sample-meeting-1/ics" style="color:#1a73e8;text-decoration:none;">download the ICS</a> instead.</div>
+          <p style="color:#6b7280;font-size:12px;margin-top:18px;">This is an automated email — please do not reply.</p>
+        </td>
+      </tr>
+    </table>
+    <!-- simple responsive tweak for smaller screens -->
+    <div style="display:none;max-height:0;overflow:hidden">
+      <style type="text/css">
+        @media only screen and (max-width: 480px) {
+          table[role='presentation']{width:100%!important}
+          td{padding-left:16px!important;padding-right:16px!important}
+        }
+      </style>
+    </div>
+  </div>

@@ -43,6 +43,31 @@ function buildPool() {
 
 const pool = buildPool();
 
+// Startup connectivity verification with retry/backoff (non-blocking export)
+pool.__ready = false;
+const maxAttempts = Number(process.env.DB_CONNECT_RETRIES || 5);
+const baseDelay = Number(process.env.DB_CONNECT_BASE_DELAY_MS || 500);
+function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
+async function verifyConnectivity() {
+  for (let attempt=1; attempt<=maxAttempts; attempt++) {
+    try {
+      await pool.query('SELECT 1');
+      pool.__ready = true;
+      if (!process.env.SUPPRESS_DB_LOG) console.log(`[DB] Connectivity established on attempt ${attempt}`);
+      return;
+    } catch (e) {
+      if (attempt === maxAttempts) {
+        console.error('[DB] Connectivity failed after retries:', e.message);
+        return; // mark as not ready; readiness endpoint will report failure
+      }
+      const backoff = Math.min(8000, Math.round(baseDelay * Math.pow(2, attempt-1) * (0.75 + Math.random()*0.5))); // jitter 75%-125%
+      if (!process.env.SUPPRESS_DB_LOG) console.warn(`[DB] connect attempt ${attempt} failed: ${e.message}. Retrying in ${backoff}ms`);
+      await delay(backoff);
+    }
+  }
+}
+verifyConnectivity().catch(()=>{});
+
 // Apply per-connection settings
 pool.on('connect', (client) => {
   // 5s statement timeout; 10s idle in transaction timeout
@@ -51,3 +76,4 @@ pool.on('connect', (client) => {
 });
 
 module.exports = pool;
+module.exports.isPoolReady = () => pool.__ready === true;
