@@ -58,7 +58,7 @@ const path = require('path');
 function resolveInlineLogo() {
   const envB64 = process.env.EMAIL_LOGO_BASE64 && process.env.EMAIL_LOGO_BASE64.trim();
   if (envB64) return `data:image/png;base64,${envB64}`;
-  const filePath = process.env.EMAIL_LOGO_PATH || path.join(__dirname, '../../assets/logo.png');
+  const filePath = process.env.EMAIL_LOGO_PATH || path.join(__dirname, '../../assets/branding/logo.png');
   try {
     if (fs.existsSync(filePath)) {
       const buf = fs.readFileSync(filePath);
@@ -73,12 +73,13 @@ function remindersEmailHtml(payload) {
   const items = Array.isArray(payload?.items) ? payload.items : [];
   const calendar = payload && payload.calendar || {};
   const isProd = (process.env.NODE_ENV || '').toLowerCase() === 'production';
-  const ui = process.env.SITE_ORIGIN || process.env.FRONTEND_ORIGIN || (!isProd ? 'http://localhost:3000' : '');
+  // Prefer explicit SITE/FRONTEND origin. In production, if not provided, fall back to the deployed frontend URL.
+  const ui = process.env.SITE_ORIGIN || process.env.FRONTEND_ORIGIN || (!isProd ? 'http://localhost:3000' : 'https://sreenidhi-crm-frontend.vercel.app');
   const originFallback = ui || (process.env.API_ORIGIN ? process.env.API_ORIGIN.replace(/\/$/, '') : 'http://localhost:3000');
   const versionTag = process.env.EMAIL_LOGO_VERSION ? `?v=${encodeURIComponent(process.env.EMAIL_LOGO_VERSION)}` : '';
   const rawBase = process.env.EMAIL_LOGO_URL && process.env.EMAIL_LOGO_URL.trim()
     ? process.env.EMAIL_LOGO_URL.trim()
-    : `${originFallback.replace(/\/$/, '')}/assets/logo.png`;
+    : `${originFallback.replace(/\/$/, '')}/assets/branding/logo.png`;
   const rawLogo = `${rawBase}${versionTag}`;
   const inlineLogo = resolveInlineLogo();
   const logoUrl = inlineLogo || rawLogo;

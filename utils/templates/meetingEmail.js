@@ -17,7 +17,7 @@ function stripUrls(text = '') {
 function resolveInlineLogo() {
   const envB64 = process.env.EMAIL_LOGO_BASE64 && process.env.EMAIL_LOGO_BASE64.trim();
   if (envB64) return `data:image/png;base64,${envB64}`;
-  const filePath = process.env.EMAIL_LOGO_PATH || path.join(__dirname, '../../assets/logo.png');
+  const filePath = process.env.EMAIL_LOGO_PATH || path.join(__dirname, '../../assets/branding/logo.png');
   try {
     if (fs.existsSync(filePath)) {
       const buf = fs.readFileSync(filePath);
@@ -35,13 +35,14 @@ function meetingEmailHtml(meeting) {
   const api = process.env.API_ORIGIN || '';
   const isProd = (process.env.NODE_ENV || '').toLowerCase() === 'production';
   // Prefer an explicit email-safe absolute URL; else try site origin; else dev localhost; else relative for preview
-  const ui = process.env.SITE_ORIGIN || process.env.FRONTEND_ORIGIN || (!isProd ? 'http://localhost:3000' : '');
+  // Prefer explicit SITE/FRONTEND origin. In production, if not provided, fall back to the deployed frontend URL.
+  const ui = process.env.SITE_ORIGIN || process.env.FRONTEND_ORIGIN || (!isProd ? 'http://localhost:3000' : 'https://sreenidhi-crm-frontend.vercel.app');
   // Build a robust absolute logo URL: prefer explicit EMAIL_LOGO_URL, else UI origin, else API origin host, else localhost.
   const originFallback = ui || (api ? api.replace(/\/$/, '') : 'http://localhost:3000');
   const versionTag = process.env.EMAIL_LOGO_VERSION ? `?v=${encodeURIComponent(process.env.EMAIL_LOGO_VERSION)}` : '';
   const baseLogo = (process.env.EMAIL_LOGO_URL && process.env.EMAIL_LOGO_URL.trim())
     ? process.env.EMAIL_LOGO_URL.trim()
-    : `${originFallback.replace(/\/$/, '')}/assets/logo.png`;
+    : `${originFallback.replace(/\/$/, '')}/assets/branding/logo.png`;
   const logoUrl = `${baseLogo}${versionTag}`;
   const inlineLogo = resolveInlineLogo();
   const finalLogo = inlineLogo || logoUrl;
@@ -57,7 +58,7 @@ function meetingEmailHtml(meeting) {
       <tr>
         <td style="background:#d62839;padding:20px 24px;color:#fff;">
           <div style="display:flex;align-items:center;gap:12px;">
-            ${finalLogo ? `<img src="${finalLogo}" alt="Sreenidhi Fuels Logo" width="160" style="display:block;height:auto;object-fit:contain" />` : `<div style=\"background:#ffd54d;color:#111;width:160px;height:60px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:28px;\">SF</div>`}
+            ${finalLogo ? `<img src="${finalLogo}" alt="Sreenidhi Fuels Logo" width="96" style="display:block;height:96px;width:96px;object-fit:contain;border-radius:50%;flex-shrink:0;" />` : `<div style=\"background:#ffd54d;color:#111;width:96px;height:96px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:28px;\">SF</div>`}
             <div>
               <div style="font-size:18px;font-weight:800;letter-spacing:.3px;">SREENIDHI</div>
               <div style="font-size:12px;opacity:.9;margin-top:-2px;">FUELS</div>
